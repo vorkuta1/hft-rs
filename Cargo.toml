@@ -8,6 +8,7 @@ members = [
     "crates/metrics",
     "crates/bins",
     "crates/replay_binance",
+    "crates/viz_l3",
     "xtask",
 ]
 

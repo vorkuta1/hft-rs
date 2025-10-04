@@ -17,6 +17,7 @@ The repository is intentionally simple: no async runtime, minimal dynamic alloca
 | `ws_binance` | Binance depth-stream handler that parses diffs and snapshots |
 | `ws_hyperliquid` | Hyperliquid order-book handler (testnet) |
 | `bins` | Binary examples (`poc_binance`, `poc_hyperliquid`) wiring handlers into the engine |
+| `viz_l3` | Egui/eframe viewer for captured L3 inference datasets |
 | `metrics`, `exec_hyperliquid` | Stubs/placeholders for future work |
 
 Each crate is independent and can be built in isolation (`cargo check -p <crate>`).
@@ -150,3 +151,17 @@ cargo run -p replay_binance -- \
 ```
 
 Use `--out-format bincode` to produce a compact binary stream suitable for offline comparison pipelines. All emitted events mirror the `InferredEvent` schema (see `crates/replay_binance/src/book.rs`).
+
+## Visualising Captured Books
+
+The `viz_l3` crate provides an interactive desktop viewer powered by `egui`/`eframe`. It plays back inferred event logs (JSONL or bincode) and renders bid/ask ladders alongside per-event metadata. Example:
+
+```bash
+cargo run -p viz_l3 -- --input \
+  data/binance/btcusdt/2025-10-04-btcusdt/inferred.jsonl
+```
+
+- `--limit <n>` can be used to load only the first `n` events for quick inspection.
+- Use the in-app slider or playback controls to scrub through events; adjust the displayed depth and price scale directly from the control bar.
+
+The viewer mirrors the reconstruction logic in `replay_binance` so it can visualise either live captures (from `poc_binance`/`poc_hyperliquid`) or offline datasets when iterating on inference heuristics.
