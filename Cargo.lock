@@ -2313,6 +2313,8 @@ dependencies = [
  "hdrhistogram",
  "http 0.2.12",
  "lexical-core 0.8.5",
+ "serde",
+ "serde_json",
  "simd-json",
  "tungstenite",
 ]

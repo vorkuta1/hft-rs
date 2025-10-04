@@ -1,11 +1,15 @@
 use ahash::AHashMap;
 use anyhow::{Context, Result, anyhow};
 use arrayvec::ArrayVec;
-use engine_core::{EngineHandler, EngineLogger, HandlerEvent};
+use engine_core::{EngineHandler, EngineLogger, HandlerEvent, LogEventKind};
 use hdrhistogram::Histogram;
+use serde_json::Value;
 use simd_json::prelude::{ValueAsContainer, ValueAsScalar};
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::net::TcpStream;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tungstenite::client::connect_with_config;
 use tungstenite::http;
 use tungstenite::protocol::WebSocketConfig;
@@ -67,6 +71,112 @@ struct BookUpdate {
     asks: ArrayVec<(u64, f64), MAX_LEVELS_PER_MSG>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CaptureConfig {
+    pub root_dir: PathBuf,
+    pub session_label: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct HyperConfig {
+    pub coin: String,
+    pub capture: Option<CaptureConfig>,
+}
+
+#[derive(serde::Serialize)]
+struct CaptureMetadata {
+    coin: String,
+    started_at_ms: u64,
+    ended_at_ms: Option<u64>,
+    updates_path: String,
+    last_timestamp_ms: Option<u64>,
+}
+
+struct CaptureWriter {
+    session_dir: PathBuf,
+    updates_writer: BufWriter<File>,
+    metadata_path: PathBuf,
+    metadata: CaptureMetadata,
+}
+
+impl CaptureWriter {
+    fn new(coin: &str, cfg: CaptureConfig) -> Result<Self> {
+        let session_label = cfg.session_label.unwrap_or_else(|| now_ms().to_string());
+        let session_dir = cfg.root_dir.join(coin.to_lowercase()).join(session_label);
+        fs::create_dir_all(&session_dir)?;
+
+        let updates_path = session_dir.join("updates.jsonl");
+        let metadata_path = session_dir.join("metadata.json");
+        let updates_writer = BufWriter::new(File::create(&updates_path)?);
+        let metadata = CaptureMetadata {
+            coin: coin.to_string(),
+            started_at_ms: now_ms(),
+            ended_at_ms: None,
+            updates_path: "updates.jsonl".into(),
+            last_timestamp_ms: None,
+        };
+
+        let mut writer = Self {
+            session_dir,
+            updates_writer,
+            metadata_path,
+            metadata,
+        };
+        writer.flush_metadata()?;
+        Ok(writer)
+    }
+
+    fn session_dir(&self) -> &Path {
+        &self.session_dir
+    }
+
+    fn record_message(&mut self, raw: &str) -> Result<()> {
+        self.updates_writer.write_all(raw.as_bytes())?;
+        if !raw.ends_with('\n') {
+            self.updates_writer.write_all(b"\n")?;
+        }
+        self.updates_writer.flush()?;
+        if let Some(timestamp) = extract_timestamp(raw) {
+            self.metadata.last_timestamp_ms = Some(timestamp);
+        }
+        self.metadata.ended_at_ms = Some(now_ms());
+        self.flush_metadata()
+    }
+
+    fn flush_metadata(&mut self) -> Result<()> {
+        let mut file = File::create(&self.metadata_path)?;
+        serde_json::to_writer_pretty(&mut file, &self.metadata)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        Ok(())
+    }
+}
+
+fn extract_timestamp(raw: &str) -> Option<u64> {
+    // Hyperliquid includes "time":<millis> or "timestamp":; keep it simple.
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        if let Some(data) = value.get("data") {
+            if let Some(ts) = data.get("time").and_then(|v| v.as_u64()) {
+                return Some(ts);
+            }
+        }
+        if let Some(ts) = value.get("time").and_then(|v| v.as_u64()) {
+            return Some(ts);
+        }
+    }
+    None
+}
+
+fn now_ms() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(dur) => dur
+            .as_secs()
+            .saturating_mul(1_000)
+            .saturating_add(dur.subsec_millis() as u64),
+        Err(_) => 0,
+    }
+}
+
 fn parse_wsbook_owned(buf: &mut [u8]) -> Result<Option<BookUpdate>> {
     let v: simd_json::BorrowedValue<'_> = simd_json::to_borrowed_value(buf)?;
     let root = if let Some(obj) = v.as_object() {
@@ -124,11 +234,27 @@ pub struct HyperHandler {
     hist: Histogram<u64>,
     subscribed: bool,
     got_initial: bool,
+    capture: Option<CaptureWriter>,
+    capture_announced: bool,
 }
 
 impl HyperHandler {
     pub fn new(coin: String) -> Self {
-        Self {
+        Self::with_config(HyperConfig {
+            coin,
+            capture: None,
+        })
+        .expect("capture disabled")
+    }
+
+    pub fn with_config(config: HyperConfig) -> Result<Self> {
+        let HyperConfig { coin, capture } = config;
+        let capture_writer = match capture {
+            Some(cfg) => Some(CaptureWriter::new(&coin, cfg)?),
+            None => None,
+        };
+
+        Ok(Self {
             coin,
             ws: None,
             book: Book::with_capacity(4096),
@@ -136,7 +262,9 @@ impl HyperHandler {
             hist: Histogram::new(3).unwrap(),
             subscribed: false,
             got_initial: false,
-        }
+            capture: capture_writer,
+            capture_announced: false,
+        })
     }
 
     fn ws_url(&self) -> String {
@@ -184,6 +312,17 @@ impl HyperHandler {
         self.ws = Some(ws);
         self.subscribed = false;
         log.handler_event("hyperliquid", &self.coin, HandlerEvent::Connected);
+
+        if !self.capture_announced {
+            if let Some(capture) = self.capture.as_ref() {
+                log.emit(LogEventKind::Text(format!(
+                    "[hyperliquid:{}] capture writing to {}",
+                    self.coin,
+                    capture.session_dir().display()
+                )));
+            }
+            self.capture_announced = true;
+        }
         Ok(())
     }
 
@@ -262,6 +401,9 @@ impl EngineHandler for HyperHandler {
             Message::Text(txt) => {
                 let len = txt.len().min(self.rx_buf.len());
                 self.rx_buf[..len].copy_from_slice(&txt.as_bytes()[..len]);
+                if let Some(capture) = self.capture.as_mut() {
+                    capture.record_message(&txt)?;
+                }
                 // Only handle WsBook channel frames
                 if txt.contains(r#""channel":"l2Book""#)
                     || txt.contains(r#""levels":"#)
@@ -297,6 +439,15 @@ impl EngineHandler for HyperHandler {
             Message::Binary(bin) => {
                 let len = bin.len().min(self.rx_buf.len());
                 self.rx_buf[..len].copy_from_slice(&bin[..len]);
+                if let Some(capture) = self.capture.as_mut() {
+                    let raw = match std::str::from_utf8(&bin) {
+                        Ok(text) => text.to_string(),
+                        Err(_) => "".to_string(),
+                    };
+                    if !raw.is_empty() {
+                        capture.record_message(&raw)?;
+                    }
+                }
                 let t0 = Instant::now();
                 if let Some(up) = parse_wsbook_owned(&mut self.rx_buf[..len])? {
                     let (bids, asks, first) = self.apply_book(&up);
