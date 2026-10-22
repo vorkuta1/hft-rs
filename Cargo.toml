@@ -3,11 +3,9 @@ members = [
     "crates/engine_core",
     "crates/ws_binance",
     "crates/ws_hyperliquid",
-    "crates/exec_hyperliquid",
     "crates/spsc",
-    "crates/metrics",
     "crates/bins",
-    "crates/replay_binance",
+    "crates/l3lab",
     "crates/viz_l3",
     "xtask",
 ]
