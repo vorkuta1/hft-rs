@@ -101,7 +101,7 @@ Sampled after every L2 batch over the top 10 levels per side, after a 30 s warm-
 
 ### Microstructure (viewer)
 
-Computed from the same L2 batches the models see, cumulative since the snapshot and sampled every 0.5 s of exchange time. Each one is split by bid/ask and by tier: the touch, and the best 20 levels.
+Computed from the same L2 batches the models see and sampled every 0.5 s of exchange time. Each one is split by bid/ask and by tier: the touch, and the best 20 levels. The ratios are **rolling**: every flow decays exponentially with a 30 s half-life, so a ratio describes the recent past rather than everything since the snapshot. A ratio stays undefined (a gap in the plot) until a side has had at least 3 fills recently, instead of spiking while it divides by almost nothing. The viewer plots them on a log scale over a fixed sliding window (30 s, 2 min or 5 min), with a dashed line at ratio = 1.
 
 - **CTR** (cancellation-to-trade ratio) = cancelled volume ÷ filled volume.
 - **OTR** (order-to-trade ratio) = added volume ÷ filled volume.

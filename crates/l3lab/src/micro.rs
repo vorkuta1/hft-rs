@@ -4,11 +4,15 @@
 //! * **CTR** (cancellation-to-trade) = cancelled volume / filled volume.
 //! * **OTR** (order-to-trade) = added volume / filled volume.
 //!
-//! Both are cumulative since the last snapshot, split by side and by tier (the
-//! touch, and the best 20 levels), and sampled on exchange time. A level change
-//! of `net` with `traded` volume filled there implies `net + traded` of hidden
-//! adds (if positive) or cancels (if negative). Also keeps a depth-time history
-//! of the best levels per side for a heatmap, and computes sweep cost curves.
+//! Both are *rolling*: every flow decays exponentially with a configurable
+//! half-life on exchange time, so a ratio reflects the recent past instead of
+//! everything since the snapshot, at O(1) cost. A ratio is undefined (`None`)
+//! until enough fills have happened recently, which replaces a divide-by-almost-
+//! zero spike with an honest gap. Split by side and by tier (the touch, and the
+//! best 20 levels), sampled on exchange time. A level change of `net` with
+//! `traded` volume filled there implies `net + traded` of hidden adds (if
+//! positive) or cancels (if negative). Also keeps a depth-time history of the
+//! best levels per side for a heatmap, and computes sweep cost curves.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -23,6 +27,10 @@ pub struct MicroConfig {
     pub sample_us: u64,
     /// History kept for the ratio plots.
     pub history_us: u64,
+    /// Half-life of the exponential decay applied to all flows.
+    pub half_life_us: u64,
+    /// Recent (decayed) fill events a side needs before its ratios are defined.
+    pub min_fill_events: f64,
     /// Levels per side in each heatmap column.
     pub heat_levels: usize,
     /// Heatmap columns kept.
@@ -34,19 +42,22 @@ impl Default for MicroConfig {
         Self {
             sample_us: 500_000,
             history_us: 300_000_000,
+            half_life_us: 30_000_000,
+            min_fill_events: 3.0,
             heat_levels: 40,
             heat_columns: 600,
         }
     }
 }
 
-/// One sample of a ratio: seconds since the first batch, per side and combined.
+/// One sample of a ratio: seconds since the first batch, per side and combined;
+/// `None` where too few recent fills make the ratio meaningless.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RatioPoint {
     pub t: f64,
-    pub bid: f64,
-    pub ask: f64,
-    pub both: f64,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub both: Option<f64>,
 }
 
 /// Best-first level totals per side at one instant (index 0 = touch).
@@ -57,11 +68,22 @@ pub struct HeatColumn {
     pub asks: Vec<Qty>,
 }
 
+/// Exponentially decayed volumes (and fill event count) for one side and tier.
 #[derive(Clone, Copy, Debug, Default)]
 struct Flows {
     fills: f64,
+    fill_events: f64,
     cancels: f64,
     inflows: f64,
+}
+
+impl Flows {
+    fn scale(&mut self, k: f64) {
+        self.fills *= k;
+        self.fill_events *= k;
+        self.cancels *= k;
+        self.inflows *= k;
+    }
 }
 
 /// Which ratio series to read.
@@ -79,6 +101,8 @@ pub struct Microstructure {
     asks: BTreeMap<Px, Qty>,
     /// `[side][tier]`, side 0 = bid, tier 0 = touch, 1 = top 20.
     flows: [[Flows; 2]; 2],
+    /// Exchange time the flows are decayed to.
+    decayed_to: Ts,
     start: Option<Ts>,
     next_sample: Ts,
     series: [VecDeque<RatioPoint>; 4],
@@ -92,6 +116,7 @@ impl Microstructure {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             flows: [[Flows::default(); 2]; 2],
+            decayed_to: 0,
             start: None,
             next_sample: 0,
             series: Default::default(),
@@ -109,15 +134,24 @@ impl Microstructure {
         }
     }
 
+    pub fn config(&self) -> MicroConfig {
+        self.cfg
+    }
+
     pub fn on_batch(&mut self, batch: &L2Batch) {
         let start = *self.start.get_or_insert(batch.start);
         if self.next_sample == 0 {
             self.next_sample = start + self.cfg.sample_us;
+            self.decayed_to = start;
         }
+        self.decay_to(batch.end);
         // Tiers are judged against the book before the batch.
         for t in &batch.trades {
             let rank = self.rank(t.side, t.px);
-            self.add(t.side, rank, |f| f.fills += t.qty as f64);
+            self.add(t.side, rank, |f| {
+                f.fills += t.qty as f64;
+                f.fill_events += 1.0;
+            });
         }
         let before: Vec<(usize, Qty)> = batch
             .levels
@@ -159,6 +193,16 @@ impl Microstructure {
         }
     }
 
+    fn decay_to(&mut self, ts: Ts) {
+        if ts <= self.decayed_to {
+            return;
+        }
+        let k = 0.5f64.powf((ts - self.decayed_to) as f64 / self.cfg.half_life_us as f64);
+        for f in self.flows.iter_mut().flatten() {
+            f.scale(k);
+        }
+        self.decayed_to = ts;
+    }
     /// Deepest known price on `side`.
     fn worst(&self, side: Side) -> Option<Px> {
         match side {
@@ -180,13 +224,19 @@ impl Microstructure {
     fn sample(&mut self, at: Ts, start: Ts) {
         let t = (at - start) as f64 / 1e6;
         let [bid, ask] = self.flows;
+        let min = self.cfg.min_fill_events;
         let point = |tier: usize, num: fn(&Flows) -> f64| {
             let (b, a) = (bid[tier], ask[tier]);
+            let ratio = |num: f64, fills: f64, events: f64| (events >= min).then(|| num / fills);
             RatioPoint {
                 t,
-                bid: ratio(num(&b), b.fills),
-                ask: ratio(num(&a), a.fills),
-                both: ratio(num(&b) + num(&a), b.fills + a.fills),
+                bid: ratio(num(&b), b.fills, b.fill_events),
+                ask: ratio(num(&a), a.fills, a.fill_events),
+                both: ratio(
+                    num(&b) + num(&a),
+                    b.fills + a.fills,
+                    b.fill_events + a.fill_events,
+                ),
             }
         };
         let points = [
@@ -246,10 +296,6 @@ impl Microstructure {
     }
 }
 
-fn ratio(num: f64, den: f64) -> f64 {
-    if den > 0.0 { num / den } else { 0.0 }
-}
-
 /// Whether `px` lies deeper than `worst` on `side`.
 fn beyond(side: Side, px: Px, worst: Option<Px>) -> bool {
     worst.is_some_and(|w| match side {
@@ -305,12 +351,27 @@ mod tests {
         }
     }
 
+    /// No decay, one fill is enough evidence: exact cumulative arithmetic.
+    fn exact() -> Microstructure {
+        Microstructure::new(MicroConfig {
+            sample_us: 10,
+            half_life_us: u64::MAX,
+            min_fill_events: 1.0,
+            ..MicroConfig::default()
+        })
+    }
+
+    fn trade(px: Px, qty: Qty) -> Trade {
+        Trade {
+            side: Side::Bid,
+            px,
+            qty,
+        }
+    }
+
     #[test]
     fn ratios_split_level_changes_into_fills_cancels_and_adds() {
-        let mut m = Microstructure::new(MicroConfig {
-            sample_us: 10,
-            ..MicroConfig::default()
-        });
+        let mut m = exact();
         m.seed(&[lu(Side::Bid, 100, 10), lu(Side::Bid, 99, 10)]);
         // Touch: 4 traded, level fell by 6 → 2 cancelled. Level 99 grew by 5.
         m.on_batch(&L2Batch {
@@ -325,19 +386,19 @@ mod tests {
             }],
         });
         let ctr1 = m.series(Ratio::CtrTop1).back().copied().unwrap();
-        assert_eq!((ctr1.bid, ctr1.ask, ctr1.both), (0.5, 0.0, 0.5));
+        assert_eq!(
+            (ctr1.bid, ctr1.ask, ctr1.both),
+            (Some(0.5), None, Some(0.5))
+        );
         let otr20 = m.series(Ratio::OtrTop20).back().copied().unwrap();
-        assert_eq!(otr20.bid, 1.25);
+        assert_eq!(otr20.bid, Some(1.25));
         let col = m.heat().back().unwrap();
         assert_eq!(col.bids, vec![4, 15]);
     }
 
     #[test]
     fn levels_scrolling_through_a_depth_limited_view_are_not_flow() {
-        let mut m = Microstructure::new(MicroConfig {
-            sample_us: 10,
-            ..MicroConfig::default()
-        });
+        let mut m = exact();
         // A 3-level feed: bids 100, 99, 98 visible.
         m.seed(&[
             lu(Side::Bid, 100, 10),
@@ -358,7 +419,7 @@ mod tests {
         });
         let ctr20 = m.series(Ratio::CtrTop20).back().copied().unwrap();
         let otr20 = m.series(Ratio::OtrTop20).back().copied().unwrap();
-        assert_eq!((ctr20.bid, otr20.bid), (0.0, 3.0));
+        assert_eq!((ctr20.bid, otr20.bid), (Some(0.0), Some(3.0)));
         // The book moves back: 101 is cancelled and 98 scrolls into view again.
         m.on_batch(&L2Batch {
             seq: 2,
@@ -369,7 +430,44 @@ mod tests {
         });
         let ctr20 = m.series(Ratio::CtrTop20).back().copied().unwrap();
         let otr20 = m.series(Ratio::OtrTop20).back().copied().unwrap();
-        assert_eq!((ctr20.bid, otr20.bid), (3.0, 3.0));
+        assert_eq!((ctr20.bid, otr20.bid), (Some(3.0), Some(3.0)));
+    }
+
+    #[test]
+    fn old_flow_fades_and_thin_evidence_reads_as_undefined() {
+        let mut m = Microstructure::new(MicroConfig {
+            sample_us: 1_000_000,
+            half_life_us: 1_000_000,
+            min_fill_events: 3.0,
+            ..MicroConfig::default()
+        });
+        m.seed(&[lu(Side::Bid, 100, 100)]);
+        let batch = |t: Ts, total: Qty, trades: Vec<Trade>| L2Batch {
+            seq: 0,
+            start: t,
+            end: t,
+            levels: vec![lu(Side::Bid, 100, total)],
+            trades,
+        };
+        // A burst: 4 fills of 1 and 36 cancelled → CTR 9.
+        m.on_batch(&batch(
+            0,
+            60,
+            vec![trade(100, 1), trade(100, 1), trade(100, 1), trade(100, 1)],
+        ));
+        m.on_batch(&batch(1_000_000, 60, vec![]));
+        let ctr = m.series(Ratio::CtrTop1).back().copied().unwrap();
+        // One half-life later: the ratio is unchanged, but only 2 recent fills remain.
+        assert_eq!(ctr.bid, None);
+        // Four seconds later another 4 fills and 4 cancelled: recent flow dominates.
+        m.on_batch(&batch(
+            5_000_000,
+            52,
+            vec![trade(100, 1), trade(100, 1), trade(100, 1), trade(100, 1)],
+        ));
+        let ctr = m.series(Ratio::CtrTop1).back().unwrap().bid.unwrap();
+        // Old burst decayed by 2^-5: (36/32 + 4) / (4/32 + 4) ≈ 1.24, far from 9.
+        assert!((ctr - (36.0 / 32.0 + 4.0) / (4.0 / 32.0 + 4.0)).abs() < 1e-9);
     }
 
     #[test]

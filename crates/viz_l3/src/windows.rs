@@ -2,12 +2,15 @@
 //! cost curves and the depth-time heatmap.
 
 use egui::{Color32, Context, Id, Pos2, Rect, TextureHandle, TextureOptions, Ui, vec2};
-use egui_plot::{AxisHints, Legend, Line, Plot, PlotPoint, PlotPoints};
+use egui_plot::{
+    AxisHints, Corner, HLine, Legend, Line, LineStyle, Plot, PlotPoint, PlotPoints,
+    uniform_grid_spacer,
+};
 use l3lab::micro::{HeatColumn, Microstructure, Ratio, RatioPoint, sweep_curve, sweep_impact};
 use l3lab::model::InferredBook;
 use l3lab::types::{Scale, Side, Ts};
 
-/// Samples before the ratio plots and heatmap render (as upstream).
+/// Samples before the heatmap renders (as upstream).
 const WARMUP: usize = 30;
 /// Levels per side fed to the sweep curves (as upstream).
 const SWEEP_LEVELS: usize = 100;
@@ -24,10 +27,14 @@ fn slot(area: Rect, i: usize) -> (Pos2, f32) {
 
 pub struct MetricsWindow {
     pub open: bool,
-    /// Per ratio: (sample count, last t) the cached points were built from.
-    keys: [(usize, f64); 4],
-    /// `[ratio][bid, ask, both]`.
-    points: [[Vec<PlotPoint>; 3]; 4],
+    /// Visible time span of the ratio plots, seconds.
+    window_s: f64,
+    /// Per ratio: (sample count, last t, window) the cached lines were built from.
+    keys: [(usize, f64, f64); 4],
+    /// `[ratio][bid, ask, both]`: contiguous runs of defined log10 values.
+    lines: [[Vec<Vec<PlotPoint>>; 3]; 4],
+    /// Exchange time (s) of the newest sample.
+    now: f64,
 }
 
 const RATIOS: [(Ratio, &str); 4] = [
@@ -37,12 +44,19 @@ const RATIOS: [(Ratio, &str); 4] = [
     (Ratio::OtrTop20, "Top-20 OTR"),
 ];
 
+/// Selectable visible spans (seconds, label).
+const WINDOWS: [(f64, &str); 3] = [(30.0, "30 s"), (120.0, "2 min"), (300.0, "5 min")];
+/// Ratios are plotted as log10; zero (e.g. no cancels) sits at this floor.
+const LOG_FLOOR: f64 = -2.0;
+
 impl MetricsWindow {
     pub fn new() -> Self {
         Self {
             open: true,
-            keys: [(usize::MAX, 0.0); 4],
-            points: Default::default(),
+            window_s: 120.0,
+            keys: [(usize::MAX, 0.0, 0.0); 4],
+            lines: Default::default(),
+            now: 0.0,
         }
     }
 
@@ -54,15 +68,31 @@ impl MetricsWindow {
             .default_pos(pos)
             .default_width(w)
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (span, label) in WINDOWS {
+                        ui.selectable_value(&mut self.window_s, span, label);
+                    }
+                    if let Some(m) = micro {
+                        let half_life = m.config().half_life_us as f64 / 1e6;
+                        ui.weak(format!("rolling, {half_life:.0} s half-life · log scale"));
+                    }
+                });
                 ui.label("Cancellation-to-Trade Ratio (CTR)");
                 ui.label("CTR > 1.0: Spoofing/Layering > Fills");
-                let samples = micro.map_or(0, |m| m.series(Ratio::CtrTop1).len());
-                let Some(micro) = micro.filter(|_| samples >= WARMUP) else {
-                    warming_up(ui, "Warming up metrics...", samples);
+                let defined = micro
+                    .is_some_and(|m| m.series(Ratio::CtrTop20).iter().any(|p| p.both.is_some()));
+                let Some(micro) = micro.filter(|_| defined) else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(50.0);
+                        ui.heading("Waiting for fills...");
+                        ui.label("A ratio needs a few recent fills before it means anything.");
+                        ui.add_space(50.0);
+                    });
                     return;
                 };
                 self.refresh(micro);
-                let plot_h = ((area.height() - 170.0) / 4.0).clamp(85.0, 150.0);
+                let plot_h = ((area.height() - 190.0) / 4.0).clamp(85.0, 150.0);
+                let x_range = (self.now - self.window_s)..=self.now;
                 for (i, (_, label)) in RATIOS.iter().enumerate() {
                     if i == 2 {
                         ui.add_space(8.0);
@@ -72,45 +102,95 @@ impl MetricsWindow {
                     } else if i > 0 {
                         ui.add_space(4.0);
                     }
-                    let [bid, ask, both] = &self.points[i];
+                    let [bid, ask, both] = &self.lines[i];
                     Plot::new(("ratio_plot", i))
                         .height(plot_h)
-                        .link_axis(Id::new("micro_ratio_x"), [true, false])
                         .link_cursor(Id::new("micro_ratio_x"), [true, false])
+                        .allow_drag(false)
+                        .allow_zoom(false)
+                        .allow_scroll(false)
                         .show_axes([true, true])
                         .y_axis_label(*label)
-                        .legend(Legend::default())
+                        .y_grid_spacer(uniform_grid_spacer(|_| [1.0, 10.0, 100.0]))
+                        .y_axis_formatter(|mark, _| ratio_label(mark.value))
+                        .label_formatter(|name, p| {
+                            format!("{name}\nt = {:.1} s\nratio = {}", p.x, ratio_label(p.y))
+                        })
+                        .legend(Legend::default().position(Corner::LeftTop))
                         .show(ui, |plot| {
-                            plot.line(
-                                Line::new("Ask", PlotPoints::Borrowed(ask)).color(Color32::RED),
+                            plot.set_plot_bounds_x(x_range.clone());
+                            plot.set_auto_bounds([false, true]);
+                            plot.hline(
+                                HLine::new("", 0.0)
+                                    .color(Color32::from_gray(90))
+                                    .style(LineStyle::dashed_dense()),
                             );
-                            plot.line(
-                                Line::new("Bid", PlotPoints::Borrowed(bid)).color(Color32::GREEN),
-                            );
-                            plot.line(
-                                Line::new("Both", PlotPoints::Borrowed(both)).color(Color32::WHITE),
-                            );
+                            for (runs, name, color) in [
+                                (ask, "Ask", Color32::RED),
+                                (bid, "Bid", Color32::GREEN),
+                                (both, "Both", Color32::WHITE),
+                            ] {
+                                for run in runs {
+                                    plot.line(
+                                        Line::new(name, PlotPoints::Borrowed(run)).color(color),
+                                    );
+                                }
+                            }
                         });
                 }
             });
         self.open = open;
     }
 
+    /// Rebuilds the visible line runs when new samples arrive or the span changes.
     fn refresh(&mut self, micro: &Microstructure) {
         for (i, (ratio, _)) in RATIOS.iter().enumerate() {
             let series = micro.series(*ratio);
-            let key = (series.len(), series.back().map_or(0.0, |p| p.t));
+            let last = series.back().map_or(0.0, |p| p.t);
+            let key = (series.len(), last, self.window_s);
+            self.now = last;
             if self.keys[i] == key {
                 continue;
             }
             self.keys[i] = key;
-            let fields: [fn(&RatioPoint) -> f64; 3] = [|p| p.bid, |p| p.ask, |p| p.both];
-            for (points, field) in self.points[i].iter_mut().zip(fields) {
-                points.clear();
-                points.extend(series.iter().map(|p| PlotPoint::new(p.t, field(p))));
+            let from = last - self.window_s;
+            let fields: [fn(&RatioPoint) -> Option<f64>; 3] = [|p| p.bid, |p| p.ask, |p| p.both];
+            for (runs, field) in self.lines[i].iter_mut().zip(fields) {
+                runs.clear();
+                let mut run: Vec<PlotPoint> = Vec::new();
+                for p in series.iter().filter(|p| p.t >= from) {
+                    match field(p) {
+                        Some(v) => run.push(PlotPoint::new(p.t, v.log10().max(LOG_FLOOR))),
+                        None if run.is_empty() => {}
+                        None => runs.push(std::mem::take(&mut run)),
+                    }
+                }
+                if !run.is_empty() {
+                    runs.push(run);
+                }
             }
         }
     }
+}
+
+/// Formats a log10 value as the ratio it stands for (0.01, 1, 30, 2.5k …).
+fn ratio_label(log: f64) -> String {
+    if log <= LOG_FLOOR {
+        return "0".into();
+    }
+    let v = 10f64.powf(log);
+    let (scaled, unit, decimals) = match v {
+        v if v >= 1e6 => (v / 1e6, "M", 1),
+        v if v >= 1e3 => (v / 1e3, "k", 1),
+        v if v >= 10.0 => (v, "", 0),
+        v if v >= 1.0 => (v, "", 1),
+        v => (v, "", 2),
+    };
+    let mut s = format!("{scaled:.decimals$}");
+    if s.contains('.') {
+        s = s.trim_end_matches('0').trim_end_matches('.').to_owned();
+    }
+    s + unit
 }
 
 pub struct SweepWindow {
@@ -474,4 +554,19 @@ fn warming_up(ui: &mut Ui, title: &str, samples: usize) {
         ));
         ui.add_space(50.0);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ratio_label;
+
+    #[test]
+    fn ratio_labels_read_as_plain_numbers() {
+        let label = |v: f64| ratio_label(v.log10());
+        assert_eq!(label(30.0), "30");
+        assert_eq!(label(1.0), "1");
+        assert_eq!(label(2500.0), "2.5k");
+        assert_eq!(label(0.05), "0.05");
+        assert_eq!(ratio_label(-2.0), "0");
+    }
 }
