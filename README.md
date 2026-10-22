@@ -16,7 +16,7 @@ flowchart LR
     TB --> SC[Scorer<br/>per model · per owner]
     M --> SC
     TB --> TR[train] --> M
-    M --> VIZ[viz_l3 ladder]
+    M --> VIZ[viz_l3 order book]
     TB --> VIZ
 ```
 
@@ -99,6 +99,15 @@ Sampled after every L2 batch over the top 10 levels per side, after a 30 s warm-
 - **size P / R / F1**: multiset overlap of order sizes (exact lot equality). Precision is over inferred orders, recall over true orders.
 - **queue-ahead error**: each real order that joins a top level gets a proxy: the n-th order the model created at that level in the same batch, or the last one it created there if it created fewer. Each sample is |qty ahead of the real order − qty ahead of the proxy| / level total. **lost** counts samples where the model already removed the proxy while the real order still rests.
 
+### Microstructure (viewer)
+
+Computed from the same L2 batches the models see, cumulative since the snapshot and sampled every 0.5 s of exchange time. Each one is split by bid/ask and by tier: the touch, and the best 20 levels.
+
+- **CTR** (cancellation-to-trade ratio) = cancelled volume ÷ filled volume.
+- **OTR** (order-to-trade ratio) = added volume ÷ filled volume.
+
+A level change of `net` where `traded` volume was filled means `net + traded` of adds (if positive) or cancels (if negative). On depth-limited feeds, a level scrolling into or out of the visible window is not counted as flow; Hyperliquid's public book is only 5 levels deep. For reference, Bitstamp BTC/USD shows a CTR of about 50 at the touch and about 670 over the top 20 levels: makers re-quote constantly.
+
 ## Results
 
 ### Conflation sweep
@@ -137,7 +146,7 @@ Trained on the capture above; tested on a second 15-minute capture from the same
 | crate | role |
 |---|---|
 | `l3lab` | library + CLI: `TruthBook` (L3/L4 from order events: owners, priority inserts, marketable orders), `Conflator` (truth → L2 batches, optional counts), models + `learn` (trainer, learned model), scorer (per model and per owner), `Session` pipeline, Bitstamp and Hyperliquid recorders and live feeds, Bitstamp/Hyperliquid/Binance capture readers |
-| `viz_l3` | egui ladder: truth and inferred queues per level, each order a segment coloured by age, owners in tooltips. Replay with seek, or live (Bitstamp, Hyperliquid public or L4) |
+| `viz_l3` | egui order book after [binance_l3_est](https://github.com/OctopusTakopi/binance_l3_est): horizontal per-level queue bars (truth beside inferred, each order a segment coloured by age or k-means size cluster, owners in tooltips), level table, and Microstructure Metrics (CTR/OTR), Sweep / Liquidity-Cost and Depth-Time Heatmap windows, plus the accuracy table. Replay with seek, or live (Bitstamp, Hyperliquid public or L4) |
 | `engine_core`, `spsc` | pinned single-thread engine loop with an SPSC-backed logger (the original low-latency PoC) |
 | `ws_binance`, `ws_hyperliquid`, `bins` | engine handlers and `poc_binance` / `poc_hyperliquid` binaries. `--capture-dir` writes the Binance captures `viz_l3` replays |
 | `xtask` | `cargo run -p xtask -- lint` (fmt check + clippy `-D warnings`) |

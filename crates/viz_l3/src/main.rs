@@ -1,7 +1,9 @@
 mod app;
+mod book;
 mod fmt;
-mod ladder;
+mod kmeans;
 mod source;
+mod windows;
 
 use std::path::PathBuf;
 
@@ -48,9 +50,9 @@ struct Args {
     /// Also run a trained model (from `l3lab train`).
     #[arg(long)]
     learned: Option<PathBuf>,
-    /// Price levels shown per side.
-    #[arg(long, default_value_t = 15)]
-    depth: usize,
+    /// Price levels shown per side (up to 200).
+    #[arg(long, default_value_t = 50)]
+    levels: usize,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -108,18 +110,21 @@ fn main() -> Result<()> {
                 names.join(", ")
             )
         })?;
-    let app = App::new(source, session, model, args.depth.max(1));
+    let app = App::new(source, session, model, args.levels);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1500.0, 950.0])
+            .with_inner_size([1600.0, 950.0])
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "L3 queue inference viewer",
+        "Order Book Visualizer",
         options,
-        Box::new(move |_cc| Ok(Box::new(app))),
+        Box::new(move |cc| {
+            App::style(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| anyhow!("eframe error: {e}"))
 }

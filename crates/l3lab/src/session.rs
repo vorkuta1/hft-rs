@@ -3,6 +3,7 @@
 use anyhow::{Result, bail};
 
 use crate::l2::{Conflator, L2Batch, LevelUpdate, levels_of};
+use crate::micro::{MicroConfig, Microstructure};
 use crate::model::{InferredBook, QueueModel};
 use crate::score::{ModelReport, OwnerReport, ScoreConfig, Scorer};
 use crate::truth::{L3Event, LevelEffect, SnapshotOrder, TruthBook};
@@ -42,6 +43,7 @@ pub struct Session {
     conflator: Conflator,
     models: Vec<InferredBook>,
     scorer: Option<Scorer>,
+    micro: Option<Microstructure>,
     effects: Vec<LevelEffect>,
     /// Event that closed the previous window; applied on the next call so the truth
     /// book stays exactly at the batch boundary between calls.
@@ -67,6 +69,7 @@ impl Session {
             conflator: Conflator::new(window, counts),
             models: models.into_iter().map(InferredBook::new).collect(),
             scorer: None,
+            micro: None,
             effects: Vec::new(),
             deferred: None,
             seq: 0,
@@ -79,6 +82,17 @@ impl Session {
     pub fn with_scorer(mut self, cfg: ScoreConfig) -> Self {
         self.scorer = Some(Scorer::new(cfg));
         self
+    }
+
+    /// Also tracks microstructure analytics (CTR/OTR, depth history) over the
+    /// L2 stream the models see.
+    pub fn with_micro(mut self, cfg: MicroConfig) -> Self {
+        self.micro = Some(Microstructure::new(cfg));
+        self
+    }
+
+    pub fn micro(&self) -> Option<&Microstructure> {
+        self.micro.as_ref()
     }
 
     /// Feeds one event; returns how many L2 batches reached the models (0 or 1).
@@ -182,6 +196,9 @@ impl Session {
         for model in &mut self.models {
             model.seed(ts, levels);
         }
+        if let Some(micro) = &mut self.micro {
+            micro.seed(levels);
+        }
         self.last_ts = ts;
         self.seeded = true;
     }
@@ -227,6 +244,9 @@ impl Session {
         }
         if let (Some(scorer), Some(truth)) = (self.scorer.as_mut(), self.truth.as_ref()) {
             scorer.observe(&batch, truth, &self.models);
+        }
+        if let Some(micro) = &mut self.micro {
+            micro.on_batch(&batch);
         }
         self.last_batch = Some(batch);
     }

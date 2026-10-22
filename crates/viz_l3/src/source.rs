@@ -6,6 +6,7 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use l3lab::learn::{LearnedModel, Policy};
+use l3lab::micro::MicroConfig;
 use l3lab::model::{QueueModel, all_models, model_by_name};
 use l3lab::score::ScoreConfig;
 use l3lab::session::{FeedEvent, L2Source, Session};
@@ -34,7 +35,7 @@ impl Setup {
         if let Some(policy) = &self.learned {
             models.push(Box::new(LearnedModel::new(policy.clone())));
         }
-        let session = Session::new(models, self.l2);
+        let session = Session::new(models, self.l2).with_micro(MicroConfig::default());
         if has_truth {
             session.with_scorer(SCORE)
         } else {

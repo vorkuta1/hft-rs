@@ -3,6 +3,7 @@
 
 pub mod l2;
 pub mod learn;
+pub mod micro;
 pub mod model;
 pub mod score;
 pub mod session;
