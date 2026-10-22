@@ -77,15 +77,15 @@ impl LogEvent {
     }
 }
 
-#[derive(Clone)]
+/// Owns the only producer handle; not `Clone`, and `!Sync` via the producer.
 pub struct Logger<const N: usize> {
     tx: Producer<LogEvent, N>,
 }
 
 impl<const N: usize> Logger<N> {
     pub fn emit(&self, kind: LogEventKind) {
-        if !self.tx.push(LogEvent::new(kind.clone())) {
-            eprintln!("[log drop] {kind:?}");
+        if let Err(dropped) = self.tx.push(LogEvent::new(kind)) {
+            eprintln!("[log drop] {:?}", dropped.kind);
         }
     }
 
@@ -110,8 +110,9 @@ impl<const N: usize> Logger<N> {
     }
 
     pub fn shutdown(&self) {
-        let event = LogEvent::new(LogEventKind::Shutdown);
-        while !self.tx.push(event.clone()) {
+        let mut event = LogEvent::new(LogEventKind::Shutdown);
+        while let Err(back) = self.tx.push(event) {
+            event = back;
             std::thread::yield_now();
         }
     }
@@ -262,7 +263,7 @@ pub struct Engine<H: EngineHandler> {
 impl<H: EngineHandler> Engine<H> {
     pub fn run(mut self) -> anyhow::Result<()> {
         let (log_tx, log_rx) = channel::<LogEvent, LOG_CAPACITY>();
-        let logger = Logger::with_producer(log_tx.clone());
+        let logger = Logger::with_producer(log_tx);
         let mut logger_thread: Option<JoinHandle<()>> = Some(
             thread::Builder::new()
                 .name("logger".into())
