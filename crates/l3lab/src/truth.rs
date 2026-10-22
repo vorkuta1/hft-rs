@@ -1,14 +1,16 @@
-//! Ground-truth order-by-order book built from a venue's L3 feed.
+//! Ground-truth order-by-order book built from a venue's L3/L4 feed.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use crate::types::{BestFirst, Px, Qty, Side, Ts};
+use crate::types::{BestFirst, Owner, Px, Qty, Side, Ts};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TruthOrder {
     pub id: u64,
     pub qty: Qty,
     pub born: Ts,
+    /// Placing account, when the venue publishes it (L4).
+    pub owner: Option<Owner>,
 }
 
 /// Resting orders at one price, in priority order.
@@ -39,9 +41,24 @@ impl TruthLevel {
         None
     }
 
-    fn push_back(&mut self, order: TruthOrder) {
+    /// Inserts directly in front of `before` when it rests here, else at the back.
+    /// Returns false if an anchor was given but not found.
+    fn insert(&mut self, order: TruthOrder, before: Option<u64>) -> bool {
         self.total += order.qty;
-        self.orders.push_back(order);
+        let Some(anchor) = before else {
+            self.orders.push_back(order);
+            return true;
+        };
+        match self.orders.iter().position(|o| o.id == anchor) {
+            Some(pos) => {
+                self.orders.insert(pos, order);
+                true
+            }
+            None => {
+                self.orders.push_back(order);
+                false
+            }
+        }
     }
 
     fn remove(&mut self, id: u64) -> Option<TruthOrder> {
@@ -59,6 +76,17 @@ impl TruthLevel {
     }
 }
 
+/// One resting order in a venue snapshot; per-level priority follows snapshot order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotOrder {
+    pub id: u64,
+    pub side: Side,
+    pub px: Px,
+    pub qty: Qty,
+    pub born: Ts,
+    pub owner: Option<Owner>,
+}
+
 /// Venue-normalised L3 message. Quantities are absolute (not deltas) so applying a
 /// message twice, or one already reflected in the snapshot, is harmless.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +96,10 @@ pub enum L3Msg {
         side: Side,
         px: Px,
         qty: Qty,
+        owner: Option<Owner>,
+        /// Rest directly in front of this resting order (priority insert) instead of
+        /// at the back of the level.
+        insert_before: Option<u64>,
     },
     /// Order still live with `remaining` open; `traded_total` is its cumulative fill.
     Update {
@@ -94,6 +126,8 @@ pub struct LevelEffect {
     pub px: Px,
     /// Level total before the event.
     pub before: Qty,
+    /// Level order count before the event.
+    pub before_count: u32,
     /// Maker volume filled at this level by the event.
     pub traded: Qty,
 }
@@ -104,6 +138,8 @@ pub struct TruthStats {
     pub unknown_refs: u64,
     /// Add for an id already live (normal right after a snapshot).
     pub duplicate_adds: u64,
+    /// Priority inserts whose anchor was not resting at that level (rested at the back).
+    pub missing_anchors: u64,
 }
 
 #[derive(Debug)]
@@ -112,9 +148,7 @@ enum State {
     /// Marketable on arrival: it trades as taker and only rests once it stops crossing.
     /// Relies on the venue reporting the taker's own fills before the maker fills
     /// that clear the way (Bitstamp does), so taker volume never counts as maker volume.
-    Pending {
-        qty: Qty,
-    },
+    Pending { qty: Qty },
 }
 
 #[derive(Debug)]
@@ -122,8 +156,21 @@ struct Meta {
     side: Side,
     px: Px,
     born: Ts,
+    owner: Option<Owner>,
     traded: Qty,
     state: State,
+}
+
+/// An order about to enter the book.
+struct Entry {
+    id: u64,
+    side: Side,
+    px: Px,
+    qty: Qty,
+    born: Ts,
+    owner: Option<Owner>,
+    traded: Qty,
+    insert_before: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -136,38 +183,62 @@ pub struct TruthBook {
 }
 
 impl TruthBook {
-    /// Seeds resting orders; per-level priority follows iteration order.
-    pub fn seed(&mut self, ts: Ts, orders: impl IntoIterator<Item = (u64, Side, Px, Qty)>) {
+    pub fn seed(&mut self, orders: impl IntoIterator<Item = SnapshotOrder>) {
         *self = Self::default();
-        for (id, side, px, qty) in orders {
-            if qty == 0 || self.index.contains_key(&id) {
+        for o in orders {
+            if o.qty == 0 || self.index.contains_key(&o.id) {
                 continue;
             }
             self.index.insert(
-                id,
+                o.id,
                 Meta {
-                    side,
-                    px,
-                    born: ts,
+                    side: o.side,
+                    px: o.px,
+                    born: o.born,
+                    owner: o.owner,
                     traded: 0,
                     state: State::Resting,
                 },
             );
-            self.side_mut(side)
-                .entry(px)
-                .or_default()
-                .push_back(TruthOrder { id, qty, born: ts });
+            self.side_mut(o.side).entry(o.px).or_default().insert(
+                TruthOrder {
+                    id: o.id,
+                    qty: o.qty,
+                    born: o.born,
+                    owner: o.owner,
+                },
+                None,
+            );
         }
     }
 
     /// Applies one event, appending every resting level it touched to `out`.
     pub fn apply(&mut self, ev: &L3Event, out: &mut Vec<LevelEffect>) {
         match ev.msg {
-            L3Msg::Add { id, side, px, qty } => {
+            L3Msg::Add {
+                id,
+                side,
+                px,
+                qty,
+                owner,
+                insert_before,
+            } => {
                 if self.index.contains_key(&id) {
                     self.stats.duplicate_adds += 1;
                 } else if qty > 0 {
-                    self.place(id, side, px, qty, ev.ts, 0, out);
+                    self.place(
+                        Entry {
+                            id,
+                            side,
+                            px,
+                            qty,
+                            born: ev.ts,
+                            owner,
+                            traded: 0,
+                            insert_before,
+                        },
+                        out,
+                    );
                 }
             }
             L3Msg::Update {
@@ -233,55 +304,45 @@ impl TruthBook {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn place(
-        &mut self,
-        id: u64,
-        side: Side,
-        px: Px,
-        qty: Qty,
-        born: Ts,
-        traded: Qty,
-        out: &mut Vec<LevelEffect>,
-    ) {
-        let state = if self.crosses(side, px) {
-            self.pending.push(id);
-            State::Pending { qty }
+    fn place(&mut self, e: Entry, out: &mut Vec<LevelEffect>) {
+        let state = if self.crosses(e.side, e.px) {
+            self.pending.push(e.id);
+            State::Pending { qty: e.qty }
         } else {
-            self.rest(id, side, px, qty, born, 0, out);
+            self.rest(&e, out);
             State::Resting
         };
         self.index.insert(
-            id,
+            e.id,
             Meta {
-                side,
-                px,
-                born,
-                traded,
+                side: e.side,
+                px: e.px,
+                born: e.born,
+                owner: e.owner,
+                traded: e.traded,
                 state,
             },
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn rest(
-        &mut self,
-        id: u64,
-        side: Side,
-        px: Px,
-        qty: Qty,
-        born: Ts,
-        traded: Qty,
-        out: &mut Vec<LevelEffect>,
-    ) {
-        let level = self.side_mut(side).entry(px).or_default();
+    fn rest(&mut self, e: &Entry, out: &mut Vec<LevelEffect>) {
+        let level = self.side_mut(e.side).entry(e.px).or_default();
         out.push(LevelEffect {
-            side,
-            px,
+            side: e.side,
+            px: e.px,
             before: level.total,
-            traded,
+            before_count: level.orders.len() as u32,
+            traded: 0,
         });
-        level.push_back(TruthOrder { id, qty, born });
+        let order = TruthOrder {
+            id: e.id,
+            qty: e.qty,
+            born: e.born,
+            owner: e.owner,
+        };
+        if !level.insert(order, e.insert_before) {
+            self.stats.missing_anchors += 1;
+        }
     }
 
     /// Removes a resting order, recording `traded` maker volume against its level.
@@ -294,6 +355,7 @@ impl TruthBook {
             side,
             px,
             before: level.total,
+            before_count: level.orders.len() as u32,
             traded,
         });
         level.remove(id);
@@ -317,7 +379,7 @@ impl TruthBook {
         };
         let fill = traded_total.saturating_sub(meta.traded);
         meta.traded = meta.traded.max(traded_total);
-        let (old_side, old_px, born) = (meta.side, meta.px, meta.born);
+        let (old_side, old_px, born, owner) = (meta.side, meta.px, meta.born, meta.owner);
 
         if let State::Pending { qty } = &mut meta.state {
             // Taker-side fills never touch the resting book.
@@ -337,7 +399,19 @@ impl TruthBook {
             // Re-priced: loses priority at the old level and re-enters at the new one.
             self.index.remove(&id);
             self.unrest(id, old_side, old_px, fill, out);
-            self.place(id, side, px, remaining, born, traded_total, out);
+            self.place(
+                Entry {
+                    id,
+                    side,
+                    px,
+                    qty: remaining,
+                    born,
+                    owner,
+                    traded: traded_total,
+                    insert_before: None,
+                },
+                out,
+            );
         } else {
             let level = self
                 .side_mut(side)
@@ -347,6 +421,7 @@ impl TruthBook {
                 side,
                 px,
                 before: level.total,
+                before_count: level.orders.len() as u32,
                 traded: fill,
             });
             level.set_qty(id, remaining);
@@ -378,17 +453,26 @@ impl TruthBook {
         while i < self.pending.len() {
             let id = self.pending[i];
             let meta = &self.index[&id];
-            let (side, px, born) = (meta.side, meta.px, meta.born);
             let State::Pending { qty } = meta.state else {
                 unreachable!("pending list holds a resting order");
             };
-            if self.crosses(side, px) {
+            let entry = Entry {
+                id,
+                side: meta.side,
+                px: meta.px,
+                qty,
+                born: meta.born,
+                owner: meta.owner,
+                traded: meta.traded,
+                insert_before: None,
+            };
+            if self.crosses(entry.side, entry.px) {
                 i += 1;
                 continue;
             }
             self.pending.swap_remove(i);
             self.index.get_mut(&id).expect("pending id indexed").state = State::Resting;
-            self.rest(id, side, px, qty, born, 0, out);
+            self.rest(&entry, out);
         }
     }
 }
@@ -407,10 +491,35 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn snap(orders: &[(u64, Side, Px, Qty)]) -> Vec<SnapshotOrder> {
+        orders
+            .iter()
+            .map(|&(id, side, px, qty)| SnapshotOrder {
+                id,
+                side,
+                px,
+                qty,
+                born: 0,
+                owner: None,
+            })
+            .collect()
+    }
+
+    fn add(id: u64, side: Side, px: Px, qty: Qty, insert_before: Option<u64>) -> L3Msg {
+        L3Msg::Add {
+            id,
+            side,
+            px,
+            qty,
+            owner: None,
+            insert_before,
+        }
+    }
+
     #[test]
     fn partial_fill_keeps_priority_and_reports_maker_volume() {
         let mut book = TruthBook::default();
-        book.seed(0, [(1, Side::Bid, 100, 5), (2, Side::Bid, 100, 3)]);
+        book.seed(snap(&[(1, Side::Bid, 100, 5), (2, Side::Bid, 100, 3)]));
         let mut out = Vec::new();
         book.apply(
             &ev(
@@ -433,6 +542,7 @@ mod tests {
                 side: Side::Bid,
                 px: 100,
                 before: 8,
+                before_count: 2,
                 traded: 3
             }]
         );
@@ -441,21 +551,10 @@ mod tests {
     #[test]
     fn marketable_order_trades_as_taker_then_rests_remainder() {
         let mut book = TruthBook::default();
-        book.seed(0, [(1, Side::Ask, 101, 2), (2, Side::Bid, 99, 1)]);
+        book.seed(snap(&[(1, Side::Ask, 101, 2), (2, Side::Bid, 99, 1)]));
         let mut out = Vec::new();
         // Buy 5 @ 101 crosses the 2 resting at 101.
-        book.apply(
-            &ev(
-                1,
-                L3Msg::Add {
-                    id: 9,
-                    side: Side::Bid,
-                    px: 101,
-                    qty: 5,
-                },
-            ),
-            &mut out,
-        );
+        book.apply(&ev(1, add(9, Side::Bid, 101, 5, None)), &mut out);
         assert!(out.is_empty(), "taker must not touch the book on arrival");
         // Bitstamp reports the taker's own fill before the makers it hit.
         book.apply(
@@ -493,17 +592,9 @@ mod tests {
     #[test]
     fn replayed_messages_are_idempotent() {
         let mut book = TruthBook::default();
-        book.seed(0, [(1, Side::Ask, 101, 2)]);
+        book.seed(snap(&[(1, Side::Ask, 101, 2)]));
         let mut out = Vec::new();
-        let add = ev(
-            1,
-            L3Msg::Add {
-                id: 1,
-                side: Side::Ask,
-                px: 101,
-                qty: 2,
-            },
-        );
+        let add = ev(1, add(1, Side::Ask, 101, 2, None));
         book.apply(&add, &mut out);
         let del = ev(
             2,
@@ -519,8 +610,23 @@ mod tests {
             book.stats(),
             TruthStats {
                 unknown_refs: 1,
-                duplicate_adds: 1
+                duplicate_adds: 1,
+                missing_anchors: 0
             }
         );
+    }
+
+    #[test]
+    fn priority_insert_jumps_ahead_of_anchor() {
+        let mut book = TruthBook::default();
+        book.seed(snap(&[(1, Side::Bid, 100, 5), (2, Side::Bid, 100, 3)]));
+        let mut out = Vec::new();
+        book.apply(&ev(1, add(3, Side::Bid, 100, 1, Some(2))), &mut out);
+        assert_eq!(ids(&book, Side::Bid, 100), vec![1, 3, 2]);
+        assert_eq!(book.level(Side::Bid, 100).unwrap().qty_ahead(2), Some(6));
+        // Unknown anchor falls back to the back of the queue and is counted.
+        book.apply(&ev(2, add(4, Side::Bid, 100, 1, Some(99))), &mut out);
+        assert_eq!(ids(&book, Side::Bid, 100), vec![1, 3, 2, 4]);
+        assert_eq!(book.stats().missing_anchors, 1);
     }
 }

@@ -117,6 +117,7 @@ fn push_levels(
             side,
             px: scale.px(px)?,
             total: scale.qty(qty)?,
+            count: None,
         });
     }
     Ok(())

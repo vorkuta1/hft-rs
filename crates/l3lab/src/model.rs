@@ -15,12 +15,48 @@ pub struct InfOrder {
     pub born_batch: u64,
 }
 
-/// Identity for the (at most one) order a model may create during `apply`.
+impl InfOrder {
+    fn new(qty: Qty, birth: Birth) -> Self {
+        Self {
+            id: birth.id,
+            qty,
+            born: birth.ts,
+            born_batch: birth.batch,
+        }
+    }
+}
+
+/// Identity for an order a model creates during `apply`.
 #[derive(Clone, Copy, Debug)]
 pub struct Birth {
     pub id: u64,
     pub ts: Ts,
     pub batch: u64,
+}
+
+/// Hands out fresh order identities for one level change.
+pub struct Births<'a> {
+    next_id: &'a mut u64,
+    ts: Ts,
+    batch: u64,
+}
+
+impl<'a> Births<'a> {
+    /// Ids come from `next_id`, which is advanced past every id handed out.
+    pub fn new(next_id: &'a mut u64, ts: Ts, batch: u64) -> Self {
+        Self { next_id, ts, batch }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Birth {
+        let id = *self.next_id;
+        *self.next_id += 1;
+        Birth {
+            id,
+            ts: self.ts,
+            batch: self.batch,
+        }
+    }
 }
 
 /// Inferred orders at one price, front of the queue first.
@@ -44,12 +80,23 @@ impl Queue {
             return;
         }
         self.total += qty;
-        self.orders.push_back(InfOrder {
-            id: birth.id,
-            qty,
-            born: birth.ts,
-            born_batch: birth.batch,
-        });
+        self.orders.push_back(InfOrder::new(qty, birth));
+    }
+
+    /// Adds an order ahead of everything resting (a priority insert).
+    pub fn push_front(&mut self, qty: Qty, birth: Birth) {
+        if qty == 0 {
+            return;
+        }
+        self.total += qty;
+        self.orders.push_front(InfOrder::new(qty, birth));
+    }
+
+    /// Removes the order at `pos` (front = 0). Returns its quantity.
+    pub fn remove_at(&mut self, pos: usize) -> Option<Qty> {
+        let order = self.orders.remove(pos)?;
+        self.total -= order.qty;
+        Some(order.qty)
     }
 
     /// Removes up to `qty` starting at the front (fills). Returns the amount removed.
@@ -104,12 +151,18 @@ pub struct LevelChange {
     pub new_total: Qty,
     /// Maker volume traded at this level in the batch (0 if the feed has no trades).
     pub traded: Qty,
+    /// Published order count after the change, if the feed has one.
+    pub count: Option<u32>,
+    /// Levels strictly better than this one on its side before the change
+    /// (0 = touch), capped at `u8::MAX`.
+    pub rank: u8,
 }
 
-/// An inference rule. `apply` must leave `queue.total() == change.new_total`.
+/// An inference rule. `apply` must leave `queue.total() == change.new_total`;
+/// every order it creates takes its identity from `births`.
 pub trait QueueModel: Send {
     fn name(&self) -> &'static str;
-    fn apply(&mut self, queue: &mut Queue, change: LevelChange, birth: Birth);
+    fn apply(&mut self, queue: &mut Queue, change: LevelChange, births: &mut Births);
 }
 
 /// Every increase joins the back; every decrease is a fill from the front.
@@ -132,10 +185,10 @@ impl QueueModel for Fifo {
         "fifo"
     }
 
-    fn apply(&mut self, queue: &mut Queue, change: LevelChange, birth: Birth) {
+    fn apply(&mut self, queue: &mut Queue, change: LevelChange, births: &mut Births) {
         let old = queue.total();
         if change.new_total > old {
-            queue.push_back(change.new_total - old, birth);
+            queue.push_back(change.new_total - old, births.next());
         } else {
             queue.take_front(old - change.new_total);
         }
@@ -147,10 +200,10 @@ impl QueueModel for Lifo {
         "lifo"
     }
 
-    fn apply(&mut self, queue: &mut Queue, change: LevelChange, birth: Birth) {
+    fn apply(&mut self, queue: &mut Queue, change: LevelChange, births: &mut Births) {
         let old = queue.total();
         if change.new_total > old {
-            queue.push_back(change.new_total - old, birth);
+            queue.push_back(change.new_total - old, births.next());
         } else {
             queue.take_back(old - change.new_total);
         }
@@ -162,10 +215,10 @@ impl QueueModel for SizeMatch {
         "size-match"
     }
 
-    fn apply(&mut self, queue: &mut Queue, change: LevelChange, birth: Birth) {
+    fn apply(&mut self, queue: &mut Queue, change: LevelChange, births: &mut Births) {
         let old = queue.total();
         if change.new_total > old {
-            queue.push_back(change.new_total - old, birth);
+            queue.push_back(change.new_total - old, births.next());
         } else {
             let cut = old - change.new_total;
             if !queue.remove_exact(cut) {
@@ -180,11 +233,11 @@ impl QueueModel for Hybrid {
         "hybrid"
     }
 
-    fn apply(&mut self, queue: &mut Queue, change: LevelChange, birth: Birth) {
+    fn apply(&mut self, queue: &mut Queue, change: LevelChange, births: &mut Births) {
         queue.take_front(change.traded);
         let rest = queue.total();
         if change.new_total > rest {
-            queue.push_back(change.new_total - rest, birth);
+            queue.push_back(change.new_total - rest, births.next());
         } else {
             let cut = rest - change.new_total;
             if !queue.remove_exact(cut) {
@@ -235,32 +288,54 @@ impl InferredBook {
         self.model.name()
     }
 
-    /// Resets to a snapshot: each level becomes one order of unknown composition.
+    /// Resets to a snapshot. Each level becomes one order of unknown composition,
+    /// or `count` equal orders when the feed publishes counts.
     pub fn seed(&mut self, ts: Ts, levels: &[LevelUpdate]) {
         self.bids.clear();
         self.asks.clear();
         for lu in levels {
-            let birth = self.birth(ts, 0);
-            self.side_mut(lu.side)
-                .entry(lu.px)
-                .or_default()
-                .push_back(lu.total, birth);
-        }
-    }
-
-    pub fn apply(&mut self, batch: &L2Batch) {
-        for lu in &batch.levels {
-            let change = LevelChange {
-                new_total: lu.total,
-                traded: batch.traded_at(lu.side, lu.px),
-            };
-            let birth = self.birth(batch.end, batch.seq);
             let book = match lu.side {
                 Side::Bid => &mut self.bids,
                 Side::Ask => &mut self.asks,
             };
             let queue = book.entry(lu.px).or_default();
-            self.model.apply(queue, change, birth);
+            let mut births = Births {
+                next_id: &mut self.next_id,
+                ts,
+                batch: 0,
+            };
+            let n = u64::from(lu.count.unwrap_or(1).max(1)).min(lu.total.max(1));
+            let each = lu.total / n;
+            for i in 0..n {
+                let qty = if i + 1 == n { lu.total - each * (n - 1) } else { each };
+                queue.push_back(qty, births.next());
+            }
+        }
+    }
+
+    pub fn apply(&mut self, batch: &L2Batch) {
+        for lu in &batch.levels {
+            let book = match lu.side {
+                Side::Bid => &mut self.bids,
+                Side::Ask => &mut self.asks,
+            };
+            let better = match lu.side {
+                Side::Bid => book.range(lu.px + 1..).take(u8::MAX as usize).count(),
+                Side::Ask => book.range(..lu.px).take(u8::MAX as usize).count(),
+            };
+            let change = LevelChange {
+                new_total: lu.total,
+                traded: batch.traded_at(lu.side, lu.px),
+                count: lu.count,
+                rank: better as u8,
+            };
+            let mut births = Births {
+                next_id: &mut self.next_id,
+                ts: batch.end,
+                batch: batch.seq,
+            };
+            let queue = book.entry(lu.px).or_default();
+            self.model.apply(queue, change, &mut births);
             assert_eq!(
                 queue.total(),
                 lu.total,
@@ -282,19 +357,6 @@ impl InferredBook {
             Side::Bid => self.bids.get(&px),
             Side::Ask => self.asks.get(&px),
         }
-    }
-
-    fn side_mut(&mut self, side: Side) -> &mut BTreeMap<Px, Queue> {
-        match side {
-            Side::Bid => &mut self.bids,
-            Side::Ask => &mut self.asks,
-        }
-    }
-
-    fn birth(&mut self, ts: Ts, batch: u64) -> Birth {
-        let id = self.next_id;
-        self.next_id += 1;
-        Birth { id, ts, batch }
     }
 }
 
@@ -323,12 +385,14 @@ mod tests {
 
     fn run(model: &mut dyn QueueModel, sizes_in: &[Qty], new_total: Qty, traded: Qty) -> Vec<Qty> {
         let mut q = queue_of(sizes_in);
-        let birth = Birth {
-            id: 99,
-            ts: 1,
-            batch: 1,
+        let mut next_id = 99;
+        let change = LevelChange {
+            new_total,
+            traded,
+            count: None,
+            rank: 0,
         };
-        model.apply(&mut q, LevelChange { new_total, traded }, birth);
+        model.apply(&mut q, change, &mut Births::new(&mut next_id, 1, 1));
         assert_eq!(q.total(), new_total);
         sizes(&q)
     }

@@ -19,7 +19,7 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
 use crate::session::FeedEvent;
-use crate::truth::{L3Event, L3Msg};
+use crate::truth::{L3Event, L3Msg, SnapshotOrder};
 use crate::types::{Px, Qty, Scale, Side, Ts};
 
 pub const WS_URL: &str = "wss://ws.bitstamp.net";
@@ -74,24 +74,26 @@ struct Snapshot<'a> {
 }
 
 /// Parses the REST `group=2` body: `[price, amount, id]` rows, time priority within a price.
+/// Bitstamp does not publish order ages, so every order is born at the snapshot time.
 pub fn parse_snapshot(body: &str, scale: Scale) -> Result<FeedEvent> {
     let snap: Snapshot = serde_json::from_str(body).context("parse bitstamp snapshot")?;
+    let ts: Ts = snap.microtimestamp.parse()?;
     let mut orders = Vec::with_capacity(snap.bids.len() + snap.asks.len());
     for (side, rows) in [(Side::Bid, &snap.bids), (Side::Ask, &snap.asks)] {
         for [px, qty, id] in rows {
-            orders.push((
-                id.parse::<u64>()
+            orders.push(SnapshotOrder {
+                id: id
+                    .parse::<u64>()
                     .with_context(|| format!("order id {id:?}"))?,
                 side,
-                scale.px(px)?,
-                scale.qty(qty)?,
-            ));
+                px: scale.px(px)?,
+                qty: scale.qty(qty)?,
+                born: ts,
+                owner: None,
+            });
         }
     }
-    Ok(FeedEvent::TruthSnapshot {
-        ts: snap.microtimestamp.parse()?,
-        orders,
-    })
+    Ok(FeedEvent::TruthSnapshot { ts, orders })
 }
 
 pub fn snapshot_ts(body: &str) -> Result<Ts> {
@@ -153,7 +155,14 @@ impl Parser {
         );
         let traded_total = self.scale.qty(d.amount_traded)?;
         let msg = match kind {
-            "order_created" => L3Msg::Add { id, side, px, qty },
+            "order_created" => L3Msg::Add {
+                id,
+                side,
+                px,
+                qty,
+                owner: None,
+                insert_before: None,
+            },
             "order_changed" => L3Msg::Update {
                 id,
                 side,

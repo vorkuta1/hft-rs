@@ -9,6 +9,8 @@ pub struct LevelUpdate {
     pub side: Side,
     pub px: Px,
     pub total: Qty,
+    /// Resting order count, for feeds that publish it (Hyperliquid `l2Book` `n`).
+    pub count: Option<u32>,
 }
 
 /// Maker volume traded at one level; `side` is the resting side.
@@ -46,12 +48,24 @@ impl L2Batch {
 /// consumer could ever see). Otherwise events are bucketed into fixed windows
 /// aligned to `ts / window_us`, like Binance's `@depth@100ms`; a level whose total is
 /// back where it started and saw no trades is omitted, exactly as the venue would.
+/// With `counts`, updates also carry the level's order count (and a count change
+/// alone is published), emulating a Hyperliquid-style feed.
 #[derive(Debug)]
 pub struct Conflator {
     window_us: u64,
+    counts: bool,
     open: Option<Bucket>,
-    /// `(side, px, total at window start, traded)` per touched level.
-    touched: Vec<(Side, Px, Qty, Qty)>,
+    touched: Vec<Touched>,
+}
+
+/// A level touched in the open window, with its state at window start.
+#[derive(Clone, Copy, Debug)]
+struct Touched {
+    side: Side,
+    px: Px,
+    before: Qty,
+    before_count: u32,
+    traded: Qty,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -62,12 +76,17 @@ struct Bucket {
 }
 
 impl Conflator {
-    pub fn new(window_us: u64) -> Self {
+    pub fn new(window_us: u64, counts: bool) -> Self {
         Self {
             window_us,
+            counts,
             open: None,
             touched: Vec::new(),
         }
+    }
+
+    pub fn counts(&self) -> bool {
+        self.counts
     }
 
     pub fn window_us(&self) -> u64 {
@@ -100,10 +119,16 @@ impl Conflator {
             match self
                 .touched
                 .iter_mut()
-                .find(|(side, px, _, _)| *side == e.side && *px == e.px)
+                .find(|t| t.side == e.side && t.px == e.px)
             {
-                Some(entry) => entry.3 += e.traded,
-                None => self.touched.push((e.side, e.px, e.before, e.traded)),
+                Some(t) => t.traded += e.traded,
+                None => self.touched.push(Touched {
+                    side: e.side,
+                    px: e.px,
+                    before: e.before,
+                    before_count: e.before_count,
+                    traded: e.traded,
+                }),
             }
         }
     }
@@ -123,16 +148,24 @@ impl Conflator {
             end,
             ..L2Batch::default()
         };
-        for (side, px, before, traded) in self.touched.drain(..) {
-            let total = truth.total(side, px);
-            if total != before || traded > 0 {
-                batch.levels.push(LevelUpdate { side, px, total });
+        for t in self.touched.drain(..) {
+            let level = truth.level(t.side, t.px);
+            let total = level.map_or(0, |l| l.total());
+            let count = level.map_or(0, |l| l.orders().len() as u32);
+            let count_moved = self.counts && count != t.before_count;
+            if total != t.before || t.traded > 0 || count_moved {
+                batch.levels.push(LevelUpdate {
+                    side: t.side,
+                    px: t.px,
+                    total,
+                    count: self.counts.then_some(count),
+                });
             }
-            if traded > 0 {
+            if t.traded > 0 {
                 batch.trades.push(Trade {
-                    side,
-                    px,
-                    qty: traded,
+                    side: t.side,
+                    px: t.px,
+                    qty: t.traded,
                 });
             }
         }
@@ -145,7 +178,7 @@ impl Conflator {
 }
 
 /// Current L2 view of a truth book (used to seed models from a snapshot).
-pub fn levels_of(truth: &TruthBook) -> Vec<LevelUpdate> {
+pub fn levels_of(truth: &TruthBook, counts: bool) -> Vec<LevelUpdate> {
     Side::BOTH
         .iter()
         .flat_map(|&side| {
@@ -153,6 +186,7 @@ pub fn levels_of(truth: &TruthBook) -> Vec<LevelUpdate> {
                 side,
                 px,
                 total: level.total(),
+                count: counts.then_some(level.orders().len() as u32),
             })
         })
         .collect()

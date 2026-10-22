@@ -24,6 +24,14 @@ pub struct Capture {
 }
 
 impl Capture {
+    /// Whether the capture carries order-level ground truth (and can be scored).
+    pub fn has_truth(&self) -> bool {
+        match self.venue {
+            Venue::Bitstamp => true,
+            Venue::Binance => false,
+        }
+    }
+
     /// Detects the venue from the files present. `scale` overrides the stored or
     /// default fixed-point scale.
     pub fn open(dir: &Path, scale: Option<Scale>) -> Result<Self> {

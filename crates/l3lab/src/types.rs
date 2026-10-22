@@ -23,6 +23,48 @@ impl Side {
     pub const BOTH: [Side; 2] = [Side::Bid, Side::Ask];
 }
 
+/// Account that placed an order (L4 venues only), e.g. a Hyperliquid address.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Owner(pub [u8; 20]);
+
+impl Owner {
+    /// Parses a `0x`-prefixed 40-hex-digit address.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let hex = raw.strip_prefix("0x").unwrap_or(raw);
+        if hex.len() != 40 {
+            bail!("address {raw:?} is not 20 bytes");
+        }
+        let mut out = [0u8; 20];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
+                .map_err(|_| anyhow!("address {raw:?} is not hex"))?;
+        }
+        Ok(Self(out))
+    }
+}
+
+impl std::fmt::Display for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("0x")?;
+        for b in self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+impl Serialize for Owner {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
 /// Iterates one side of a price-keyed book from the touch outward.
 pub enum BestFirst<'a, V> {
     Bids(Rev<btree_map::Iter<'a, Px, V>>),
