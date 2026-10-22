@@ -49,31 +49,32 @@ fn ws_connect_follow_redirects(
                         | StatusCode::PERMANENT_REDIRECT
                 );
 
-                if is_redirect && hops < max_hops {
-                    if let Some(loc) = resp.headers().get(http::header::LOCATION) {
-                        let loc = String::from_utf8_lossy(loc.as_bytes());
-                        let new_uri = loc.trim();
+                if is_redirect
+                    && hops < max_hops
+                    && let Some(loc) = resp.headers().get(http::header::LOCATION)
+                {
+                    let loc = String::from_utf8_lossy(loc.as_bytes());
+                    let new_uri = loc.trim();
 
-                        let mut builder = http::Request::builder()
-                            .method("GET")
-                            .uri(new_uri)
-                            .header("Connection", "Upgrade")
-                            .header("Upgrade", "websocket")
-                            .header("Sec-WebSocket-Version", "13")
-                            .header("Sec-WebSocket-Key", "follow-redirect-key")
-                            .header("Origin", "https://binance.com");
+                    let mut builder = http::Request::builder()
+                        .method("GET")
+                        .uri(new_uri)
+                        .header("Connection", "Upgrade")
+                        .header("Upgrade", "websocket")
+                        .header("Sec-WebSocket-Version", "13")
+                        .header("Sec-WebSocket-Key", "follow-redirect-key")
+                        .header("Origin", "https://binance.com");
 
-                        if let Some(host) = http::Uri::try_from(new_uri)
-                            .ok()
-                            .and_then(|uri| uri.authority().map(|a| a.to_string()))
-                        {
-                            builder = builder.header("Host", host);
-                        }
-
-                        req = builder.body(()).map_err(|e| anyhow!("{e}"))?;
-                        hops += 1;
-                        continue;
+                    if let Some(host) = http::Uri::try_from(new_uri)
+                        .ok()
+                        .and_then(|uri| uri.authority().map(|a| a.to_string()))
+                    {
+                        builder = builder.header("Host", host);
                     }
+
+                    req = builder.body(()).map_err(|e| anyhow!("{e}"))?;
+                    hops += 1;
+                    continue;
                 }
                 return Err(anyhow!("WS HTTP error: {status}"));
             }
@@ -160,23 +161,21 @@ fn parse_diff_owned(buf: &mut [u8]) -> Result<DiffOwned> {
 
     if let Some(bb) = obj.get("b").and_then(|x| x.as_array()) {
         for e in bb.iter().take(MAX_LEVELS_PER_MSG) {
-            if let Some(pq) = e.as_array() {
-                if pq.len() >= 2 {
-                    if let (Some(p), Some(q)) = (pq[0].as_str(), pq[1].as_str()) {
-                        bids.push((px_to_ticks(p)?, qty_from_str(q)?));
-                    }
-                }
+            if let Some(pq) = e.as_array()
+                && pq.len() >= 2
+                && let (Some(p), Some(q)) = (pq[0].as_str(), pq[1].as_str())
+            {
+                bids.push((px_to_ticks(p)?, qty_from_str(q)?));
             }
         }
     }
     if let Some(aa) = obj.get("a").and_then(|x| x.as_array()) {
         for e in aa.iter().take(MAX_LEVELS_PER_MSG) {
-            if let Some(pq) = e.as_array() {
-                if pq.len() >= 2 {
-                    if let (Some(p), Some(q)) = (pq[0].as_str(), pq[1].as_str()) {
-                        asks.push((px_to_ticks(p)?, qty_from_str(q)?));
-                    }
-                }
+            if let Some(pq) = e.as_array()
+                && pq.len() >= 2
+                && let (Some(p), Some(q)) = (pq[0].as_str(), pq[1].as_str())
+            {
+                asks.push((px_to_ticks(p)?, qty_from_str(q)?));
             }
         }
     }

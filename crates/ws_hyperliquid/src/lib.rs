@@ -155,10 +155,10 @@ impl CaptureWriter {
 fn extract_timestamp(raw: &str) -> Option<u64> {
     // Hyperliquid includes "time":<millis> or "timestamp":; keep it simple.
     if let Ok(value) = serde_json::from_str::<Value>(raw) {
-        if let Some(data) = value.get("data") {
-            if let Some(ts) = data.get("time").and_then(|v| v.as_u64()) {
-                return Some(ts);
-            }
+        if let Some(data) = value.get("data")
+            && let Some(ts) = data.get("time").and_then(|v| v.as_u64())
+        {
+            return Some(ts);
         }
         if let Some(ts) = value.get("time").and_then(|v| v.as_u64()) {
             return Some(ts);
@@ -204,23 +204,23 @@ fn parse_wsbook_owned(buf: &mut [u8]) -> Result<Option<BookUpdate>> {
     let mut asks = ArrayVec::<(u64, f64), MAX_LEVELS_PER_MSG>::new();
 
     for e in bids_a.iter().take(MAX_LEVELS_PER_MSG) {
-        if let Some(lvl) = e.as_object() {
-            if let (Some(px), Some(sz)) = (
+        if let Some(lvl) = e.as_object()
+            && let (Some(px), Some(sz)) = (
                 lvl.get("px").and_then(|x| x.as_str()),
                 lvl.get("sz").and_then(|x| x.as_str()),
-            ) {
-                bids.push((px_to_ticks(px)?, sz_from_str(sz)?));
-            }
+            )
+        {
+            bids.push((px_to_ticks(px)?, sz_from_str(sz)?));
         }
     }
     for e in asks_a.iter().take(MAX_LEVELS_PER_MSG) {
-        if let Some(lvl) = e.as_object() {
-            if let (Some(px), Some(sz)) = (
+        if let Some(lvl) = e.as_object()
+            && let (Some(px), Some(sz)) = (
                 lvl.get("px").and_then(|x| x.as_str()),
                 lvl.get("sz").and_then(|x| x.as_str()),
-            ) {
-                asks.push((px_to_ticks(px)?, sz_from_str(sz)?));
-            }
+            )
+        {
+            asks.push((px_to_ticks(px)?, sz_from_str(sz)?));
         }
     }
     Ok(Some(BookUpdate { bids, asks }))
