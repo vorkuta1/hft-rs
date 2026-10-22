@@ -12,10 +12,16 @@ use crate::types::Ts;
 #[derive(Clone, Debug)]
 pub enum FeedEvent {
     /// Full L3/L4 book; per-level priority follows order.
-    TruthSnapshot { ts: Ts, orders: Vec<SnapshotOrder> },
+    TruthSnapshot {
+        ts: Ts,
+        orders: Vec<SnapshotOrder>,
+    },
     Truth(L3Event),
     /// Full L2 book as the venue publishes it.
-    L2Snapshot { ts: Ts, levels: Vec<LevelUpdate> },
+    L2Snapshot {
+        ts: Ts,
+        levels: Vec<LevelUpdate>,
+    },
     L2(L2Batch),
 }
 

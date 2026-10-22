@@ -111,12 +111,159 @@ impl Queue {
 
     /// Removes the newest order of exactly `qty`, if any.
     pub fn remove_exact(&mut self, qty: Qty) -> bool {
-        let Some(pos) = self.orders.iter().rposition(|o| o.qty == qty) else {
-            return false;
+        match self.orders.iter().rposition(|o| o.qty == qty) {
+            Some(pos) => self.remove_at(pos).is_some(),
+            None => false,
+        }
+    }
+
+    /// Removes the oldest order of exactly `qty`, if any.
+    pub fn remove_exact_oldest(&mut self, qty: Qty) -> bool {
+        match self.orders.iter().position(|o| o.qty == qty) {
+            Some(pos) => self.remove_at(pos).is_some(),
+            None => false,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.orders.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.orders.is_empty()
+    }
+
+    /// Appends `qty` as `pieces` near-equal orders (the last takes the remainder);
+    /// `pieces` is clamped to `1..=qty`.
+    pub fn push_split(&mut self, qty: Qty, pieces: u64, births: &mut Births) {
+        let n = pieces.clamp(1, qty.max(1));
+        let each = qty / n;
+        for i in 0..n {
+            let q = if i + 1 == n {
+                qty - each * (n - 1)
+            } else {
+                each
+            };
+            self.push_back(q, births.next());
+        }
+    }
+
+    /// Shrinks the order at `pos` by `by` (< its size) without moving it.
+    fn reduce_at(&mut self, pos: usize, by: Qty) {
+        let order = &mut self.orders[pos];
+        debug_assert!(order.qty > by);
+        order.qty -= by;
+        self.total -= by;
+    }
+
+    /// Replaces the order at `pos` with `pieces` new orders of the same total.
+    fn split_at(&mut self, pos: usize, pieces: u64, births: &mut Births) {
+        let Some(order) = self.orders.remove(pos) else {
+            return;
         };
-        self.orders.remove(pos);
-        self.total -= qty;
-        true
+        let n = pieces.clamp(1, order.qty);
+        let each = order.qty / n;
+        for i in 0..n {
+            let q = if i + 1 == n {
+                order.qty - each * (n - 1)
+            } else {
+                each
+            };
+            self.orders
+                .insert(pos + i as usize, InfOrder::new(q, births.next()));
+        }
+    }
+
+    /// Merges the newest `n` orders into one new order at the back.
+    fn merge_back(&mut self, n: usize, births: &mut Births) {
+        let n = n.min(self.orders.len());
+        if n < 2 {
+            return;
+        }
+        let qty: Qty = self
+            .orders
+            .drain(self.orders.len() - n..)
+            .map(|o| o.qty)
+            .sum();
+        self.orders.push_back(InfOrder::new(qty, births.next()));
+    }
+
+    /// Splits or merges orders until there are `count` of them, keeping the total
+    /// (best effort: a queue of unit orders cannot grow further).
+    fn reconcile_count(&mut self, count: usize, births: &mut Births) {
+        if count == 0 {
+            return;
+        }
+        if self.orders.len() > count {
+            self.merge_back(self.orders.len() - count + 1, births);
+        }
+        while self.orders.len() < count {
+            // Newest splittable order: the most likely home of unseen arrivals.
+            let Some(pos) = self.orders.iter().rposition(|o| o.qty >= 2) else {
+                break;
+            };
+            let want = (count - self.orders.len() + 1) as u64;
+            self.split_at(pos, want, births);
+        }
+    }
+
+    /// A shrink of `cut` that keeps the order count: a partial fill or reduction
+    /// of the first order (from the front) larger than `cut`; failing that, the
+    /// newest exact-size order, else quantity from the back.
+    fn reduce(&mut self, cut: Qty) {
+        if cut == 0 {
+            return;
+        }
+        if let Some(pos) = self.orders.iter().position(|o| o.qty > cut) {
+            self.reduce_at(pos, cut);
+        } else if !self.remove_exact(cut) {
+            self.take_back(cut);
+        }
+    }
+
+    /// Removes up to `m` whole orders whose sizes best explain a drop of `cut`:
+    /// an exact single (m = 1) or pair (m = 2) match, newest first; otherwise
+    /// greedily the largest orders that still fit. Any unexplained rest is a
+    /// [`reduce`](Self::reduce).
+    fn remove_explaining(&mut self, cut: Qty, m: usize) {
+        if m == 1 && self.remove_exact(cut) {
+            return;
+        }
+        if m == 2 && self.remove_exact_pair(cut) {
+            return;
+        }
+        let mut left = cut;
+        for _ in 0..m {
+            let best = self
+                .orders
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| o.qty <= left)
+                .max_by_key(|&(i, o)| (o.qty, i));
+            let Some((pos, _)) = best else { break };
+            left -= self.remove_at(pos).expect("position in range");
+            if left == 0 {
+                return;
+            }
+        }
+        self.reduce(left);
+    }
+
+    /// Removes two orders summing to `cut`, preferring the newest such pair.
+    fn remove_exact_pair(&mut self, cut: Qty) -> bool {
+        let n = self.orders.len();
+        for j in (1..n).rev() {
+            let need = match cut.checked_sub(self.orders[j].qty) {
+                Some(need) if need > 0 => need,
+                _ => continue,
+            };
+            if let Some(i) = self.orders.range(..j).rposition(|o| o.qty == need) {
+                self.remove_at(j);
+                self.remove_at(i);
+                return true;
+            }
+        }
+        false
     }
 
     fn take(&mut self, qty: Qty, front: bool) -> Qty {
@@ -179,6 +326,14 @@ pub struct SizeMatch;
 /// Uses trades: traded volume fills from the front, the rest of the change is
 /// treated as adds (back) or cancels (exact size match, else newest first).
 pub struct Hybrid;
+
+/// Uses published order counts: with k = count − inferred orders (after traded
+/// volume fills from the front), a drop with k < 0 removes |k| orders whose sizes
+/// best explain it, a drop with k ≥ 0 is a partial fill/reduction near the front,
+/// a rise with k > 0 is k new orders sharing it; leftover count mismatches are
+/// reconciled by merging the newest orders or splitting the newest splittable one.
+/// Without counts it behaves exactly like [`Hybrid`].
+pub struct Count;
 
 impl QueueModel for Fifo {
     fn name(&self) -> &'static str {
@@ -247,7 +402,35 @@ impl QueueModel for Hybrid {
     }
 }
 
-pub const MODEL_NAMES: [&str; 4] = ["fifo", "lifo", "size-match", "hybrid"];
+impl QueueModel for Count {
+    fn name(&self) -> &'static str {
+        "count"
+    }
+
+    fn apply(&mut self, queue: &mut Queue, change: LevelChange, births: &mut Births) {
+        let count = match change.count {
+            Some(c) if c > 0 || change.new_total == 0 => c as usize,
+            _ => return Hybrid.apply(queue, change, births),
+        };
+        queue.take_front(change.traded);
+        let rest = queue.total();
+        let k = count as i64 - queue.len() as i64;
+        if change.new_total > rest {
+            let add = change.new_total - rest;
+            queue.push_split(add, k.max(1) as u64, births);
+        } else if change.new_total < rest {
+            let cut = rest - change.new_total;
+            if k < 0 {
+                queue.remove_explaining(cut, k.unsigned_abs() as usize);
+            } else {
+                queue.reduce(cut);
+            }
+        }
+        queue.reconcile_count(count, births);
+    }
+}
+
+pub const MODEL_NAMES: [&str; 5] = ["fifo", "lifo", "size-match", "hybrid", "count"];
 
 pub fn model_by_name(name: &str) -> Option<Box<dyn QueueModel>> {
     Some(match name {
@@ -255,6 +438,7 @@ pub fn model_by_name(name: &str) -> Option<Box<dyn QueueModel>> {
         "lifo" => Box::new(Lifo),
         "size-match" => Box::new(SizeMatch),
         "hybrid" => Box::new(Hybrid),
+        "count" => Box::new(Count),
         _ => return None,
     })
 }
@@ -266,28 +450,25 @@ pub fn all_models() -> Vec<Box<dyn QueueModel>> {
         .collect()
 }
 
-/// A full book of inferred queues driven by one model.
-pub struct InferredBook {
-    model: Box<dyn QueueModel>,
+/// Per-price inferred queues for both sides, without a model attached.
+#[derive(Clone, Debug)]
+pub struct Book {
     bids: BTreeMap<Px, Queue>,
     asks: BTreeMap<Px, Queue>,
     next_id: u64,
 }
 
-impl InferredBook {
-    pub fn new(model: Box<dyn QueueModel>) -> Self {
+impl Default for Book {
+    fn default() -> Self {
         Self {
-            model,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             next_id: 1,
         }
     }
+}
 
-    pub fn name(&self) -> &'static str {
-        self.model.name()
-    }
-
+impl Book {
     /// Resets to a snapshot. Each level becomes one order of unknown composition,
     /// or `count` equal orders when the feed publishes counts.
     pub fn seed(&mut self, ts: Ts, levels: &[LevelUpdate]) {
@@ -299,21 +480,19 @@ impl InferredBook {
                 Side::Ask => &mut self.asks,
             };
             let queue = book.entry(lu.px).or_default();
-            let mut births = Births {
-                next_id: &mut self.next_id,
-                ts,
-                batch: 0,
-            };
-            let n = u64::from(lu.count.unwrap_or(1).max(1)).min(lu.total.max(1));
-            let each = lu.total / n;
-            for i in 0..n {
-                let qty = if i + 1 == n { lu.total - each * (n - 1) } else { each };
-                queue.push_back(qty, births.next());
-            }
+            let mut births = Births::new(&mut self.next_id, ts, 0);
+            queue.push_split(lu.total, u64::from(lu.count.unwrap_or(1)), &mut births);
         }
     }
 
-    pub fn apply(&mut self, batch: &L2Batch) {
+    /// Applies every level update of `batch` in order through `f`, which must
+    /// leave the queue at the published total (`who` names the culprit if not).
+    pub fn apply_with(
+        &mut self,
+        batch: &L2Batch,
+        who: &str,
+        mut f: impl FnMut(&LevelUpdate, &mut Queue, LevelChange, &mut Births),
+    ) {
         for lu in &batch.levels {
             let book = match lu.side {
                 Side::Bid => &mut self.bids,
@@ -329,18 +508,13 @@ impl InferredBook {
                 count: lu.count,
                 rank: better as u8,
             };
-            let mut births = Births {
-                next_id: &mut self.next_id,
-                ts: batch.end,
-                batch: batch.seq,
-            };
+            let mut births = Births::new(&mut self.next_id, batch.end, batch.seq);
             let queue = book.entry(lu.px).or_default();
-            self.model.apply(queue, change, &mut births);
+            f(lu, queue, change, &mut births);
             assert_eq!(
                 queue.total(),
                 lu.total,
-                "model {} broke the level-total invariant",
-                self.model.name()
+                "model {who} broke the level-total invariant"
             );
             if queue.total() == 0 {
                 book.remove(&lu.px);
@@ -357,6 +531,47 @@ impl InferredBook {
             Side::Bid => self.bids.get(&px),
             Side::Ask => self.asks.get(&px),
         }
+    }
+}
+
+/// A full book of inferred queues driven by one model.
+pub struct InferredBook {
+    model: Box<dyn QueueModel>,
+    book: Book,
+}
+
+impl InferredBook {
+    pub fn new(model: Box<dyn QueueModel>) -> Self {
+        Self {
+            model,
+            book: Book::default(),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.model.name()
+    }
+
+    /// Resets to a snapshot (see [`Book::seed`]).
+    pub fn seed(&mut self, ts: Ts, levels: &[LevelUpdate]) {
+        self.book.seed(ts, levels);
+    }
+
+    pub fn apply(&mut self, batch: &L2Batch) {
+        let name = self.model.name();
+        let model = &mut self.model;
+        self.book
+            .apply_with(batch, name, |_, queue, change, births| {
+                model.apply(queue, change, births)
+            });
+    }
+
+    pub fn levels(&self, side: Side) -> BestFirst<'_, Queue> {
+        self.book.levels(side)
+    }
+
+    pub fn queue(&self, side: Side, px: Px) -> Option<&Queue> {
+        self.book.queue(side, px)
     }
 }
 
@@ -384,12 +599,22 @@ mod tests {
     }
 
     fn run(model: &mut dyn QueueModel, sizes_in: &[Qty], new_total: Qty, traded: Qty) -> Vec<Qty> {
+        run_counted(model, sizes_in, new_total, traded, None)
+    }
+
+    fn run_counted(
+        model: &mut dyn QueueModel,
+        sizes_in: &[Qty],
+        new_total: Qty,
+        traded: Qty,
+        count: Option<u32>,
+    ) -> Vec<Qty> {
         let mut q = queue_of(sizes_in);
         let mut next_id = 99;
         let change = LevelChange {
             new_total,
             traded,
-            count: None,
+            count,
             rank: 0,
         };
         model.apply(&mut q, change, &mut Births::new(&mut next_id, 1, 1));
@@ -413,6 +638,60 @@ mod tests {
         assert_eq!(run(&mut Hybrid, &[5, 3, 4], 6, 2), vec![3, 3]);
         // 5 traded but the level grew by 1: 6 must have joined behind.
         assert_eq!(run(&mut Hybrid, &[5, 3, 4], 13, 5), vec![3, 4, 6]);
+    }
+
+    #[test]
+    fn count_model_uses_count_and_size_changes_together() {
+        let count = |s: &[Qty], new_total, traded, n| {
+            run_counted(&mut Count, s, new_total, traded, Some(n))
+        };
+        // One order fewer and an exact single match: that order was cancelled.
+        assert_eq!(count(&[5, 3, 4], 9, 0, 2), vec![5, 4]);
+        // Two fewer, no single match: the newest exact pair (3 + 4 = 7).
+        assert_eq!(count(&[5, 3, 4, 1], 6, 0, 2), vec![5, 1]);
+        // Same count, smaller total: a partial reduction at the front.
+        assert_eq!(count(&[5, 3, 4], 10, 0, 3), vec![3, 3, 4]);
+        // Two more orders: the increase is split between them.
+        assert_eq!(count(&[5], 11, 0, 3), vec![5, 3, 3]);
+        // Traded volume fills the front order; nothing else changed.
+        assert_eq!(count(&[5, 3, 4], 7, 5, 2), vec![3, 4]);
+        // Grew by 1 yet lost an order: newest orders merge into the arrival.
+        assert_eq!(count(&[5, 3, 4], 13, 0, 2), vec![5, 8]);
+        // Flat total, more orders: the newest order splits.
+        assert_eq!(count(&[6], 6, 0, 3), vec![2, 2, 2]);
+        // Without counts it is hybrid.
+        assert_eq!(
+            run(&mut Count, &[5, 3, 4], 6, 2),
+            run(&mut Hybrid, &[5, 3, 4], 6, 2)
+        );
+    }
+
+    #[test]
+    fn count_model_keeps_total_and_reaches_feasible_counts() {
+        let mut s: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rnd = |n: u64| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s % n
+        };
+        for _ in 0..5000 {
+            let sizes_in: Vec<Qty> = (0..rnd(7)).map(|_| 1 + rnd(6)).collect();
+            let old: Qty = sizes_in.iter().sum();
+            let new_total = rnd(old + 10);
+            let traded = if rnd(3) == 0 { rnd(old + 1) } else { 0 };
+            let n = if new_total == 0 {
+                0
+            } else {
+                1 + rnd(new_total.min(9)) as u32
+            };
+            let out = run_counted(&mut Count, &sizes_in, new_total, traded, Some(n));
+            assert_eq!(
+                out.len(),
+                n as usize,
+                "{sizes_in:?} -> {new_total} (traded {traded})"
+            );
+        }
     }
 
     #[test]

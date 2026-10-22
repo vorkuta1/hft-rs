@@ -1,5 +1,6 @@
 pub mod binance;
 pub mod bitstamp;
+pub mod hyperliquid;
 
 use std::path::Path;
 
@@ -14,6 +15,8 @@ pub enum Venue {
     Bitstamp,
     /// L2 only.
     Binance,
+    /// Public L2 (`l2Book` + `trades`), plus L4 ground truth when recorded from a node.
+    Hyperliquid,
 }
 
 /// A capture directory opened for replay.
@@ -21,15 +24,13 @@ pub struct Capture {
     pub venue: Venue,
     pub scale: Scale,
     pub events: Box<dyn Iterator<Item = Result<FeedEvent>> + Send>,
+    truth: bool,
 }
 
 impl Capture {
     /// Whether the capture carries order-level ground truth (and can be scored).
     pub fn has_truth(&self) -> bool {
-        match self.venue {
-            Venue::Bitstamp => true,
-            Venue::Binance => false,
-        }
+        self.truth
     }
 
     /// Detects the venue from the files present. `scale` overrides the stored or
@@ -44,6 +45,7 @@ impl Capture {
                 venue: Venue::Bitstamp,
                 scale,
                 events: Box::new(bitstamp::CaptureReader::open(dir, scale)?),
+                truth: true,
             })
         } else if dir.join("diffs.jsonl").exists() {
             let scale = scale.unwrap_or(binance::DEFAULT_SCALE);
@@ -51,10 +53,22 @@ impl Capture {
                 venue: Venue::Binance,
                 scale,
                 events: Box::new(binance::CaptureReader::open(dir, scale)?),
+                truth: false,
+            })
+        } else if dir.join("public.jsonl").exists() {
+            let scale = match scale {
+                Some(s) => s,
+                None => hyperliquid::CaptureReader::read_metadata(dir)?.scale,
+            };
+            Ok(Self {
+                venue: Venue::Hyperliquid,
+                scale,
+                events: Box::new(hyperliquid::CaptureReader::open(dir, scale)?),
+                truth: hyperliquid::has_l4(dir),
             })
         } else {
             bail!(
-                "{} is not a capture (expected orders.jsonl or diffs.jsonl)",
+                "{} is not a capture (expected orders.jsonl, diffs.jsonl or public.jsonl)",
                 dir.display()
             )
         }

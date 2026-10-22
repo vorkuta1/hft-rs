@@ -148,7 +148,9 @@ enum State {
     /// Marketable on arrival: it trades as taker and only rests once it stops crossing.
     /// Relies on the venue reporting the taker's own fills before the maker fills
     /// that clear the way (Bitstamp does), so taker volume never counts as maker volume.
-    Pending { qty: Qty },
+    Pending {
+        qty: Qty,
+    },
 }
 
 #[derive(Debug)]

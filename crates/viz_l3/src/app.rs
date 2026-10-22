@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use egui::{Color32, Context, RichText, Ui};
 use l3lab::score::ModelReport;
-use l3lab::session::Session;
+use l3lab::session::{L2Source, Session};
 use l3lab::venue::Venue;
 
 use crate::fmt;
@@ -160,7 +160,7 @@ impl App {
                     Source::Replay(replay) => replay_info(ui, replay, &self.session),
                     Source::Live(live) => {
                         ui.label("venue");
-                        ui.label(format!("Bitstamp live ({})", live.pair));
+                        ui.label(live.feed.describe());
                         ui.end_row();
                         ui.label("status");
                         let (text, color) = match live.status {
@@ -178,8 +178,18 @@ impl App {
                         ui.end_row();
                     }
                 }
-                ui.label("conflation");
-                ui.label(format!("{} ms", self.session.conflate_us() / 1000));
+                ui.label("models see");
+                ui.label(match self.session.l2_source() {
+                    L2Source::Derived {
+                        conflate_us,
+                        counts,
+                    } => format!(
+                        "derived L2, {} ms{}",
+                        conflate_us / 1000,
+                        if counts { " + counts" } else { "" }
+                    ),
+                    L2Source::Venue => "venue L2 feed".into(),
+                });
                 ui.end_row();
                 ui.label("exchange time");
                 let ts = self.session.last_ts();
@@ -306,9 +316,11 @@ impl App {
 
 fn replay_info(ui: &mut Ui, replay: &Replay, session: &Session) {
     ui.label("venue");
-    ui.label(match replay.venue {
-        Venue::Bitstamp => "Bitstamp capture (L3 truth)",
-        Venue::Binance => "Binance capture (L2 only)",
+    ui.label(match (replay.venue, replay.has_truth) {
+        (Venue::Bitstamp, _) => "Bitstamp capture (L3 truth)",
+        (Venue::Binance, _) => "Binance capture (L2 only)",
+        (Venue::Hyperliquid, true) => "Hyperliquid capture (L4 truth + public L2)",
+        (Venue::Hyperliquid, false) => "Hyperliquid capture (public L2 only)",
     });
     ui.end_row();
     ui.label("path");

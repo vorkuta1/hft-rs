@@ -5,11 +5,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
+use l3lab::learn::{LearnedModel, Policy, Trainer};
 use l3lab::model::{MODEL_NAMES, QueueModel, all_models, model_by_name};
 use l3lab::score::{ModelReport, OwnerReport, ScoreConfig};
 use l3lab::session::{L2Source, Session};
 use l3lab::types::Scale;
-use l3lab::venue::{Capture, bitstamp};
+use l3lab::venue::{Capture, bitstamp, hyperliquid};
 
 #[derive(Parser)]
 #[command(about = "L2→L3 order-queue inference lab")]
@@ -37,6 +38,24 @@ enum Cmd {
         px_decimals: u32,
         #[arg(long, default_value_t = bitstamp::DEFAULT_SCALE.qty_decimals)]
         qty_decimals: u32,
+    },
+    /// Record a Hyperliquid capture: public l2Book + trades, plus L4 ground truth from an
+    /// order_book_server when --l4-server is given.
+    RecordHl {
+        #[arg(long, default_value = "BTC")]
+        coin: String,
+        /// order_book_server websocket, e.g. ws://host:8000/ws.
+        #[arg(long)]
+        l4_server: Option<String>,
+        /// Capture root; the session lands in <out>/hyperliquid/<coin>/<session>/.
+        #[arg(long, default_value = "data")]
+        out: PathBuf,
+        /// Session label (default: start time in epoch ms).
+        #[arg(long)]
+        session: Option<String>,
+        /// Recording length in seconds.
+        #[arg(long, default_value_t = 600)]
+        secs: u64,
     },
     /// Score every model on a ground-truth capture.
     Score {
@@ -67,6 +86,32 @@ enum Cmd {
         /// Also write the results as JSON.
         #[arg(long)]
         json: Option<PathBuf>,
+        /// Also score a trained model (from `l3lab train`) as `learned`.
+        #[arg(long)]
+        learned: Option<PathBuf>,
+    },
+    /// Fit the `learned` model by oracle labelling on ground-truth captures.
+    Train {
+        #[arg(required = true)]
+        captures: Vec<PathBuf>,
+        /// Where to write the model JSON.
+        #[arg(long)]
+        out: PathBuf,
+        /// Conflation window of the derived L2 the model will see.
+        #[arg(long, default_value_t = 100)]
+        conflate_ms: u64,
+        /// Derived L2 also publishes per-level order counts.
+        #[arg(long)]
+        counts: bool,
+        /// Train on the capture's own recorded L2 feed (ignores --conflate-ms / --counts).
+        #[arg(long)]
+        venue_l2: bool,
+        /// Seconds per capture before samples are recorded.
+        #[arg(long, default_value_t = 30)]
+        warmup_secs: u64,
+        /// Samples a bucket needs before it overrides its coarser backoff.
+        #[arg(long, default_value_t = 20)]
+        min_support: u64,
     },
 }
 
@@ -102,6 +147,23 @@ fn main() -> Result<()> {
             println!("{}", dir.display());
             Ok(())
         }
+        Cmd::RecordHl {
+            coin,
+            l4_server,
+            out,
+            session,
+            secs,
+        } => {
+            let dir = hyperliquid::record(&hyperliquid::RecordOptions {
+                coin,
+                root: out,
+                session,
+                duration: Duration::from_secs(secs),
+                l4_server,
+            })?;
+            println!("{}", dir.display());
+            Ok(())
+        }
         Cmd::Score {
             capture,
             conflate_ms,
@@ -112,7 +174,9 @@ fn main() -> Result<()> {
             models,
             by_user,
             json,
+            learned,
         } => {
+            let learned = learned.as_deref().map(Policy::load).transpose()?;
             let cfg = ScoreConfig {
                 top_k: top,
                 warmup_us: warmup_secs * 1_000_000,
@@ -130,7 +194,7 @@ fn main() -> Result<()> {
             };
             let mut runs = Vec::new();
             for source in sources {
-                let run = score(&capture, source, cfg, &models, by_user)?;
+                let run = score(&capture, source, cfg, &models, learned.as_ref(), by_user)?;
                 print_run(&run);
                 runs.push(run);
             }
@@ -139,6 +203,25 @@ fn main() -> Result<()> {
                     .with_context(|| format!("write {}", path.display()))?;
             }
             Ok(())
+        }
+        Cmd::Train {
+            captures,
+            out,
+            conflate_ms,
+            counts,
+            venue_l2,
+            warmup_secs,
+            min_support,
+        } => {
+            let source = if venue_l2 {
+                L2Source::Venue
+            } else {
+                L2Source::Derived {
+                    conflate_us: conflate_ms * 1000,
+                    counts,
+                }
+            };
+            train(&captures, &out, source, warmup_secs, min_support)
         }
     }
 }
@@ -175,6 +258,7 @@ fn score(
     source: L2Source,
     cfg: ScoreConfig,
     models: &[String],
+    learned: Option<&Policy>,
     by_user: usize,
 ) -> Result<Run> {
     let cap = Capture::open(capture, None)?;
@@ -184,7 +268,11 @@ fn score(
             capture.display()
         );
     }
-    let mut session = Session::new(pick_models(models)?, source).with_scorer(cfg);
+    let mut models = pick_models(models)?;
+    if let Some(policy) = learned {
+        models.push(Box::new(LearnedModel::new(policy.clone())));
+    }
+    let mut session = Session::new(models, source).with_scorer(cfg);
     let t0 = Instant::now();
     for ev in cap.events {
         session.ingest(ev?)?;
@@ -223,6 +311,38 @@ fn score(
         models: reports,
         owners,
     })
+}
+
+fn train(
+    captures: &[PathBuf],
+    out: &Path,
+    source: L2Source,
+    warmup_secs: u64,
+    min_support: u64,
+) -> Result<()> {
+    let mut trainer = Trainer::new(source, warmup_secs, min_support);
+    let t0 = Instant::now();
+    for capture in captures {
+        let cap = Capture::open(capture, None)?;
+        if !cap.has_truth() {
+            bail!(
+                "{} has no L3/L4 ground truth to train on",
+                capture.display()
+            );
+        }
+        trainer.train_capture(&capture.display().to_string(), cap.events)?;
+    }
+    let policy = trainer.finish();
+    policy.save(out)?;
+    println!(
+        "trained on {} capture(s), {}, in {} ms -> {}\n",
+        captures.len(),
+        describe(source),
+        t0.elapsed().as_millis(),
+        out.display()
+    );
+    print!("{}", policy.summary(12));
+    Ok(())
 }
 
 fn print_run(run: &Run) {
@@ -268,7 +388,9 @@ fn print_run(run: &Run) {
     }
     for (model, rows) in &run.owners {
         println!("\n#### {model}: busiest owners\n");
-        println!("| owner | orders sampled | size recall | ahead samples | ahead err mean | ahead lost |");
+        println!(
+            "| owner | orders sampled | size recall | ahead samples | ahead err mean | ahead lost |"
+        );
         println!("|---|---:|---:|---:|---:|---:|");
         for o in rows {
             println!(

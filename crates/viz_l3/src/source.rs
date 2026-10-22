@@ -1,15 +1,16 @@
 //! Feed sources driving the UI's `Session`: a seekable capture replay or a live socket.
 
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use anyhow::{Context, Result};
-use l3lab::model::{all_models, model_by_name};
+use l3lab::learn::{LearnedModel, Policy};
+use l3lab::model::{QueueModel, all_models, model_by_name};
 use l3lab::score::ScoreConfig;
-use l3lab::session::{FeedEvent, Session};
+use l3lab::session::{FeedEvent, L2Source, Session};
 use l3lab::types::Scale;
-use l3lab::venue::{Capture, Venue, bitstamp};
+use l3lab::venue::{Capture, Venue, bitstamp, hyperliquid};
 
 const SCORE: ScoreConfig = ScoreConfig {
     top_k: 10,
@@ -17,7 +18,30 @@ const SCORE: ScoreConfig = ScoreConfig {
 };
 const MAX_ERRORS: usize = 20;
 
-type Events = Box<dyn Iterator<Item = Result<FeedEvent>> + Send>;
+type Events = std::iter::Peekable<Box<dyn Iterator<Item = Result<FeedEvent>> + Send>>;
+
+/// How sessions are built; kept so replays can rebuild them on restart and seek.
+#[derive(Clone)]
+pub struct Setup {
+    pub l2: L2Source,
+    pub learned: Option<Policy>,
+}
+
+impl Setup {
+    /// Every rule model, plus the trained one if given; scored when there is truth.
+    fn session(&self, has_truth: bool) -> Session {
+        let mut models: Vec<Box<dyn QueueModel>> = all_models();
+        if let Some(policy) = &self.learned {
+            models.push(Box::new(LearnedModel::new(policy.clone())));
+        }
+        let session = Session::new(models, self.l2);
+        if has_truth {
+            session.with_scorer(SCORE)
+        } else {
+            session
+        }
+    }
+}
 
 pub enum Source {
     Replay(Replay),
@@ -33,42 +57,34 @@ impl Source {
     }
 }
 
-/// Every model, scored when the source carries ground truth.
-fn new_session(conflate_us: u64, has_truth: bool) -> Session {
-    let session = Session::new(all_models(), conflate_us);
-    if has_truth {
-        session.with_scorer(SCORE)
-    } else {
-        session
-    }
-}
-
 pub struct Replay {
     pub dir: PathBuf,
     pub venue: Venue,
+    pub has_truth: bool,
     pub scale: Scale,
     /// Batches in the whole capture.
     pub total: u64,
-    conflate_us: u64,
+    setup: Setup,
     events: Events,
     exhausted: bool,
 }
 
 impl Replay {
     /// Counts the capture's batches, then opens it positioned at batch 0 (snapshot applied).
-    pub fn open(dir: PathBuf, conflate_us: u64) -> Result<(Self, Session)> {
-        let total = count_batches(&dir, conflate_us)?;
+    pub fn open(dir: PathBuf, setup: Setup) -> Result<(Self, Session)> {
+        let total = count_batches(&dir, setup.l2)?;
         let capture = Capture::open(&dir, None)?;
         let mut replay = Self {
             dir,
             venue: capture.venue,
+            has_truth: capture.has_truth(),
             scale: capture.scale,
             total,
-            conflate_us,
-            events: capture.events,
+            setup,
+            events: capture.events.peekable(),
             exhausted: false,
         };
-        let mut session = new_session(conflate_us, replay.venue == Venue::Bitstamp);
+        let mut session = replay.setup.session(replay.has_truth);
         replay.prime(&mut session)?;
         Ok((replay, session))
     }
@@ -76,9 +92,9 @@ impl Replay {
     /// Reopens the capture from the start.
     pub fn restart(&mut self) -> Result<Session> {
         let capture = Capture::open(&self.dir, Some(self.scale))?;
-        self.events = capture.events;
+        self.events = capture.events.peekable();
         self.exhausted = false;
-        let mut session = new_session(self.conflate_us, self.venue == Venue::Bitstamp);
+        let mut session = self.setup.session(self.has_truth);
         self.prime(&mut session)?;
         Ok(session)
     }
@@ -109,19 +125,22 @@ impl Replay {
         self.exhausted || session.batches() >= self.total
     }
 
-    /// Applies the leading snapshot so batch 0 shows a book.
+    /// Ingests the capture's leading snapshots (truth and/or L2) so batch 0 shows a book.
     fn prime(&mut self, session: &mut Session) -> Result<()> {
-        if let Some(ev) = self.events.next() {
-            session.ingest(ev?)?;
+        while let Some(Ok(FeedEvent::TruthSnapshot { .. } | FeedEvent::L2Snapshot { .. })) =
+            self.events.peek()
+        {
+            let ev = self.events.next().expect("peeked")?;
+            session.ingest(ev)?;
         }
         Ok(())
     }
 }
 
-fn count_batches(dir: &std::path::Path, conflate_us: u64) -> Result<u64> {
+fn count_batches(dir: &std::path::Path, l2: L2Source) -> Result<u64> {
     let capture = Capture::open(dir, None)?;
     let model = model_by_name("fifo").expect("fifo is registered");
-    let mut session = Session::new(vec![model], conflate_us);
+    let mut session = Session::new(vec![model], l2);
     for ev in capture.events {
         session.ingest(ev?)?;
     }
@@ -136,8 +155,34 @@ pub enum LiveStatus {
     Ended,
 }
 
+/// Which live stream to follow.
+pub enum LiveFeed {
+    /// Bitstamp L3 truth; models see derived L2.
+    Bitstamp { pair: String },
+    /// Hyperliquid public `l2Book` + trades; models only (no truth).
+    HyperliquidPublic { coin: String },
+    /// Hyperliquid L4 truth from an `order_book_server`; models see derived L2.
+    HyperliquidL4 { coin: String, server: String },
+}
+
+impl LiveFeed {
+    pub fn describe(&self) -> String {
+        match self {
+            LiveFeed::Bitstamp { pair } => format!("Bitstamp live L3 ({pair})"),
+            LiveFeed::HyperliquidPublic { coin } => format!("Hyperliquid live public L2 ({coin})"),
+            LiveFeed::HyperliquidL4 { coin, server } => {
+                format!("Hyperliquid live L4 ({coin} via {server})")
+            }
+        }
+    }
+
+    fn has_truth(&self) -> bool {
+        !matches!(self, LiveFeed::HyperliquidPublic { .. })
+    }
+}
+
 pub struct Live {
-    pub pair: String,
+    pub feed: LiveFeed,
     pub scale: Scale,
     pub status: LiveStatus,
     pub events: u64,
@@ -147,28 +192,52 @@ pub struct Live {
 }
 
 impl Live {
-    pub fn start(pair: String, conflate_us: u64) -> Result<(Self, Session)> {
-        let scale = bitstamp::DEFAULT_SCALE;
+    /// Starts the feed thread. The public Hyperliquid feed always drives the models
+    /// directly (`setup.l2` is overridden to `Venue`); the truth feeds use `setup.l2`.
+    pub fn start(feed: LiveFeed, mut setup: Setup) -> Result<(Self, Session)> {
+        let scale = match &feed {
+            LiveFeed::Bitstamp { .. } => bitstamp::DEFAULT_SCALE,
+            LiveFeed::HyperliquidPublic { coin } | LiveFeed::HyperliquidL4 { coin, .. } => {
+                hyperliquid::fetch_scale(coin)?
+            }
+        };
+        if let LiveFeed::HyperliquidPublic { .. } = feed {
+            setup.l2 = L2Source::Venue;
+        }
         let (tx, rx) = mpsc::channel();
-        let feed_pair = pair.clone();
+        let run: Box<dyn FnOnce(Sender<Result<FeedEvent>>) -> Result<()> + Send> = match &feed {
+            LiveFeed::Bitstamp { pair } => {
+                let pair = pair.clone();
+                Box::new(move |tx| bitstamp::live_feed(&pair, scale, tx))
+            }
+            LiveFeed::HyperliquidPublic { coin } => {
+                let coin = coin.clone();
+                Box::new(move |tx| hyperliquid::live_public(&coin, scale, tx))
+            }
+            LiveFeed::HyperliquidL4 { coin, server } => {
+                let (coin, server) = (coin.clone(), server.clone());
+                Box::new(move |tx| hyperliquid::live_l4(&server, &coin, scale, tx))
+            }
+        };
         thread::Builder::new()
-            .name("bitstamp-feed".into())
+            .name("live-feed".into())
             .spawn(move || {
                 let err_tx = tx.clone();
-                if let Err(e) = bitstamp::live_feed(&feed_pair, scale, tx) {
+                if let Err(e) = run(tx) {
                     let _ = err_tx.send(Err(e));
                 }
             })
             .context("spawn live feed thread")?;
+        let session = setup.session(feed.has_truth());
         let live = Self {
-            pair,
+            feed,
             scale,
             status: LiveStatus::Connecting,
             events: 0,
             errors: Vec::new(),
             rx,
         };
-        Ok((live, new_session(conflate_us, true)))
+        Ok((live, session))
     }
 
     /// Ingests everything the feed thread has sent since the last call.

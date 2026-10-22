@@ -2,6 +2,7 @@
 //! against a venue that publishes every order.
 
 pub mod l2;
+pub mod learn;
 pub mod model;
 pub mod score;
 pub mod session;

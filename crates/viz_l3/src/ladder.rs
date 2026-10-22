@@ -4,7 +4,7 @@
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 use l3lab::model::InferredBook;
 use l3lab::truth::TruthBook;
-use l3lab::types::{Px, Qty, Scale, Side, Ts};
+use l3lab::types::{Owner, Px, Qty, Scale, Side, Ts};
 
 use crate::fmt;
 
@@ -37,6 +37,8 @@ struct Seg {
     born: Ts,
     /// `Some(batch)` for inferred orders.
     born_batch: Option<u64>,
+    /// Placing account of a truth order (L4 venues).
+    owner: Option<Owner>,
 }
 
 impl Ladder<'_> {
@@ -180,6 +182,7 @@ impl Ladder<'_> {
                     qty: o.qty,
                     born: o.born,
                     born_batch: None,
+                    owner: o.owner,
                 });
                 hit = hit.or(self.bar(&painter, side, left, top, sx, segs, hover));
             }
@@ -201,6 +204,7 @@ impl Ladder<'_> {
                 qty: o.qty,
                 born: o.born,
                 born_batch: Some(o.born_batch),
+                owner: None,
             });
             hit = hit.or(self.bar(&painter, side, left, top, sx, segs, hover));
         }
@@ -291,6 +295,9 @@ impl Ladder<'_> {
             fmt::age(self.now.saturating_sub(seg.born))
         ));
         ui.label(format!("id: {}", seg.id));
+        if let Some(owner) = seg.owner {
+            ui.label(format!("owner: {owner}"));
+        }
         match seg.born_batch {
             Some(0) => {
                 ui.label("born: snapshot (unknown composition)");
